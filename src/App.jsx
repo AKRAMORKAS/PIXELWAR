@@ -475,8 +475,8 @@ function App() {
     }
   }, [now, votingEnd, president, presidencyEnd]);
 
-  // Оптимизированный рендеринг карты с requestAnimationFrame
-  const drawMap = useCallback(() => {
+  // Рисуем карту на canvas
+  useEffect(() => {
     if (!canvasRef.current) return;
     const ctx = canvasRef.current.getContext('2d');
     ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -569,12 +569,8 @@ function App() {
       }
     });
     setAnimations(prev => prev.filter(anim => currentTime - anim.time < 1000));
-  }, [map, zoom, offset, playerId, cooldown, placingBunker, placingArtillery, placingWall, placingFactory, hoverX, hoverY, animations]);
 
-  useEffect(() => {
-    const animId = requestAnimationFrame(drawMap);
-    return () => cancelAnimationFrame(animId);
-  }, [drawMap]);
+  }, [map, zoom, offset, playerId, cooldown, placingBunker, placingArtillery, placingWall, placingFactory, hoverX, hoverY, animations]);
 
   // Детект изменений карты для анимаций
   useEffect(() => {
@@ -1801,8 +1797,8 @@ function App() {
       >
         <canvas
           ref={canvasRef}
-          width={window.innerWidth}
-          height={window.innerHeight}
+          width={WIDTH * PIXEL_SIZE}
+          height={HEIGHT * PIXEL_SIZE}
           style={{
             display: 'block',
             position: 'absolute',
