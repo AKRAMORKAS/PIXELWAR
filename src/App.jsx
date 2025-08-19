@@ -9,8 +9,9 @@ import { getAnalytics } from "firebase/analytics";
 const firebaseConfig = {
   apiKey: "AIzaSyAWjienwezNfIafxbSGGaZ9Aefo8n-_X3U",
   authDomain: "warpixel-5d49a.firebaseapp.com",
+  databaseURL: "https://warpixel-5d49a-default-rtdb.europe-west1.firebasedatabase.app",
   projectId: "warpixel-5d49a",
-  storageBucket: "warpixel-5d49a.firebasestorage.app",
+  storageBucket: "warpixel-5d49a.appspot.com",
   messagingSenderId: "178465479901",
   appId: "1:178465479901:web:533caafe0b021406eb8f34",
   measurementId: "G-E4WJQ4WSVZ"
