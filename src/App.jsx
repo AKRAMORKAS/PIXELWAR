@@ -606,10 +606,8 @@ function App() {
     const { p1, p2, total } = countCells(map);
     if (p1 / total > 0.9) {
       alert('Синяя команда победила! Игра начинается заново.');
-      resetGame();
     } else if (p2 / total > 0.9) {
       alert('Красная команда победила! Игра начинается заново.');
-      resetGame();
     }
   }, [map]);
 
@@ -692,7 +690,7 @@ function App() {
         }
         const withEnclaves = captureEnclaves(newMap, 2);
         set(ref(database, 'map'), withEnclaves);
-        return now + 10000;
+        return now + 5000;
       }
       return current;
     });
@@ -744,36 +742,6 @@ function App() {
       return () => clearInterval(deductId);
     }
   }, [aiWorkEnabled, balance, user]);
-
-  function resetGame() {
-    set(ref(database, 'map'), generateMap());
-    set(ref(database, 'blueTreasury'), 10000);
-    set(ref(database, 'redTreasury'), 10000);
-    set(ref(database, 'globalWorkBonus'), 0);
-    set(ref(database, 'bankRate'), 0.0001);
-    set(ref(database, 'bankUpgradeLevel'), 0);
-    set(ref(database, 'workUpgradeLevel'), 0);
-    set(ref(database, 'president'), '');
-    set(ref(database, 'presidencyEnd'), 0);
-    set(ref(database, 'candidates'), []);
-    set(ref(database, 'votes'), {});
-    set(ref(database, 'votingEnd'), 0);
-    set(ref(database, 'messages'), null); // Clear messages
-    set(ref(database, 'botCooldownEnd'), 0);
-    set(ref(database, 'lastIncomeTimeBlue'), Date.now());
-    set(ref(database, 'lastIncomeTimeRed'), Date.now());
-
-    // Reset user data for all users? For simplicity, reset current user
-    set(ref(database, `users/${user.uid}/balance`), 0);
-    set(ref(database, `users/${user.uid}/bank`), 0);
-    set(ref(database, `users/${user.uid}/lastWithdraw`), 0);
-    set(ref(database, `users/${user.uid}/voted`), false);
-    set(ref(database, `users/${user.uid}/workLevel`), 1);
-    set(ref(database, `users/${user.uid}/workCost`), 10);
-    set(ref(database, `users/${user.uid}/playerLosses`), 0);
-    set(ref(database, `users/${user.uid}/aiWorkEnabled`), false);
-    // Note: In a real app, you'd need to reset all users, perhaps with a server function.
-  }
 
   function handleCanvasClick(e) {
     const rect = canvasRef.current.getBoundingClientRect();
@@ -1257,24 +1225,6 @@ function App() {
           >
             Меню
           </button>
-          {username === 'Admin' && (
-            <button
-              style={{
-                background: '#f44336',
-                color: '#fff',
-                border: 'none',
-                borderRadius: 4,
-                padding: '6px 16px',
-                fontSize: 15,
-                fontWeight: 600,
-                cursor: 'pointer',
-                transition: 'background 0.2s'
-              }}
-              onClick={resetGame}
-            >
-              Рестарт
-            </button>
-          )}
         </div>
       </div>
 
@@ -1786,23 +1736,6 @@ function App() {
                     onClick={handleResign}
                   >
                     Отставка
-                  </button>
-                </div>
-                <div style={{ marginBottom: 8 }}>
-                  <button
-                    style={{
-                      background: '#f44336',
-                      color: '#fff',
-                      border: 'none',
-                      borderRadius: 4,
-                      padding: '8px 20px',
-                      fontSize: 16,
-                      fontWeight: 600,
-                      cursor: 'pointer'
-                    }}
-                    onClick={resetGame}
-                  >
-                    Сброс раунда
                   </button>
                 </div>
               </div>
