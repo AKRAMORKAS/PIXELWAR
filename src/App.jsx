@@ -798,9 +798,15 @@ function App() {
         if (!valid) break;
       }
       if (valid) {
+        if (blueTreasury < BUNKER_COST) {
+          alert('Недостаточно средств в казне');
+          setPlacingBunker(false);
+          return;
+        }
         const newMap = map.map(row => row.map(cell => ({ ...cell })));
         addBunker(newMap, x, y, playerId);
         setAnimations(prev => [...prev, {x, y, type: 'bunker', time: Date.now()}]);
+        set(ref(database, 'blueTreasury'), blueTreasury - BUNKER_COST);
         set(ref(database, 'map'), newMap);
         setPlacingBunker(false);
       } else {
@@ -811,9 +817,15 @@ function App() {
 
     if (placingWall) {
       if (map[y][x].id === playerId && map[y][x].building === 'none') {
+        if (blueTreasury < WALL_COST) {
+          alert('Недостаточно средств в казне');
+          setPlacingWall(false);
+          return;
+        }
         const newMap = map.map(row => row.map(cell => ({ ...cell })));
         addWall(newMap, x, y, playerId);
         setAnimations(prev => [...prev, {x, y, type: 'capture', time: Date.now()}]);
+        set(ref(database, 'blueTreasury'), blueTreasury - WALL_COST);
         set(ref(database, 'map'), newMap);
         setPlacingWall(false);
       } else {
@@ -824,9 +836,15 @@ function App() {
 
     if (placingFactory) {
       if (map[y][x].id === playerId && map[y][x].building === 'none') {
+        if (blueTreasury < FACTORY_COST) {
+          alert('Недостаточно средств в казне');
+          setPlacingFactory(false);
+          return;
+        }
         const newMap = map.map(row => row.map(cell => ({ ...cell })));
         addFactory(newMap, x, y, playerId);
         setAnimations(prev => [...prev, {x, y, type: 'capture', time: Date.now()}]);
+        set(ref(database, 'blueTreasury'), blueTreasury - FACTORY_COST);
         set(ref(database, 'map'), newMap);
         setPlacingFactory(false);
       } else {
@@ -858,7 +876,13 @@ function App() {
         }
       }
       if (affected) {
+        if (blueTreasury < ARTILLERY_COST) {
+          alert('Недостаточно средств в казне');
+          setPlacingArtillery(false);
+          return;
+        }
         setAnimations(prev => [...prev, {x, y, type: 'artillery', time: Date.now()}]);
+        set(ref(database, 'blueTreasury'), blueTreasury - ARTILLERY_COST);
         set(ref(database, 'map'), newMap);
         setPlacingArtillery(false);
       } else {
@@ -1043,26 +1067,18 @@ function App() {
   }
 
   function handleBuildBunker() {
-    if (blueTreasury < BUNKER_COST) return;
-    set(ref(database, 'blueTreasury'), blueTreasury - BUNKER_COST);
     setPlacingBunker(true);
   }
 
   function handleBuildWall() {
-    if (blueTreasury < WALL_COST) return;
-    set(ref(database, 'blueTreasury'), blueTreasury - WALL_COST);
     setPlacingWall(true);
   }
 
   function handleBuildFactory() {
-    if (blueTreasury < FACTORY_COST) return;
-    set(ref(database, 'blueTreasury'), blueTreasury - FACTORY_COST);
     setPlacingFactory(true);
   }
 
   function handleArtillery() {
-    if (blueTreasury < ARTILLERY_COST) return;
-    set(ref(database, 'blueTreasury'), blueTreasury - ARTILLERY_COST);
     setPlacingArtillery(true);
   }
 
@@ -1073,6 +1089,7 @@ function App() {
   }
 
   function handleNominate() {
+    if (president) return;
     if (!username) return;
 
     setCandidates(prev => {
@@ -1491,17 +1508,17 @@ function App() {
                 <div style={{ marginBottom: 8 }}>
                   <button
                     style={{
-                      background: candidates.includes(username) || !username ? '#888' : '#ffe259',
-                      color: candidates.includes(username) || !username ? '#ccc' : '#222',
+                      background: candidates.includes(username) || !username || !!president ? '#888' : '#ffe259',
+                      color: candidates.includes(username) || !username || !!president ? '#ccc' : '#222',
                       border: 'none',
                       borderRadius: 4,
                       padding: '6px 12px',
                       fontSize: 14,
                       fontWeight: 600,
-                      cursor: candidates.includes(username) || !username ? 'not-allowed' : 'pointer',
+                      cursor: candidates.includes(username) || !username || !!president ? 'not-allowed' : 'pointer',
                       marginRight: 8
                     }}
-                    disabled={candidates.includes(username) || !username}
+                    disabled={candidates.includes(username) || !username || !!president}
                     onClick={handleNominate}
                   >
                     Кандидатура
@@ -1769,6 +1786,23 @@ function App() {
                     onClick={handleResign}
                   >
                     Отставка
+                  </button>
+                </div>
+                <div style={{ marginBottom: 8 }}>
+                  <button
+                    style={{
+                      background: '#f44336',
+                      color: '#fff',
+                      border: 'none',
+                      borderRadius: 4,
+                      padding: '8px 20px',
+                      fontSize: 16,
+                      fontWeight: 600,
+                      cursor: 'pointer'
+                    }}
+                    onClick={resetGame}
+                  >
+                    Сброс раунда
                   </button>
                 </div>
               </div>
