@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import './App.css';
 import { initializeApp } from "firebase/app";
-import { getDatabase, ref, onValue, set, push } from "firebase/database";
+import { getDatabase, ref, onValue, set, push, runTransaction } from "firebase/database";
 import { getAuth, signInAnonymously } from "firebase/auth";
 import { getAnalytics } from "firebase/analytics";
 
@@ -35,13 +35,27 @@ const PIXEL_SIZE = 6;
  */
 function generateMap() {
   const map = Array.from({ length: HEIGHT }, () =>
-    Array.from({ length: WIDTH }, (_, x) => ({ id: x < 20 ? 1 : x > WIDTH - 21 ? 2 : 0, fort: 0 }))
+    Array.from({ length: WIDTH }, (_, x) => ({ id: x < 20 ? 1 : x > WIDTH - 21 ? 2 : 0, fort: 0, resource: false }))
   );
 
   // Изначальные бункеры для красной команды (игрок 2)
   addBunker(map, WIDTH - 30, 30, 2);
   addBunker(map, WIDTH - 30, Math.floor(HEIGHT / 2), 2);
   addBunker(map, WIDTH - 30, HEIGHT - 30, 2);
+
+  // Добавляем ресурсные клетки в нейтральной зоне
+  const resourceCount = 20;
+  for (let i = 0; i < resourceCount; i++) {
+    let placed = false;
+    while (!placed) {
+      const x = Math.floor(Math.random() * (WIDTH - 41)) + 20; // 20 to WIDTH-21
+      const y = Math.floor(Math.random() * HEIGHT);
+      if (!map[y][x].resource) {
+        map[y][x].resource = true;
+        placed = true;
+      }
+    }
+  }
 
   return map;
 }
@@ -151,6 +165,19 @@ function countCells(m) {
 }
 
 /**
+ * Подсчёт ресурсных клеток для команды
+ */
+function countResources(map, playerId) {
+  let count = 0;
+  for (let y = 0; y < HEIGHT; y++) {
+    for (let x = 0; x < WIDTH; x++) {
+      if (map[y][x].id === playerId && map[y][x].resource) count++;
+    }
+  }
+  return count;
+}
+
+/**
  * --- Цвета ---
  */
 const colors = {
@@ -191,11 +218,16 @@ const WORK_UPGRADE_BASE_COST = 2000;
 const BANK_RATE_STEP = 0.0001; // +0.01%
 const BANK_MAX_RATE = 0.05; // 5%
 const ARTILLERY_COST = 5000;
+const AI_WORK_COST = 20000;
+const AI_WORK_MAINTENANCE = 200; // per minute
+const CAPTURE_NEUTRAL_COST = 50;
+const CAPTURE_ENEMY_COST = 100;
 
 function App() {
   const playerId = 1;
   const [user, setUser] = useState(null);
   const [map, setMap] = useState(generateMap());
+  const prevMapRef = useRef(null);
   const [cooldown, setCooldown] = useState(false);
   const [placingBunker, setPlacingBunker] = useState(false);
   const [placingArtillery, setPlacingArtillery] = useState(false);
@@ -214,8 +246,10 @@ function App() {
   const [workLevel, setWorkLevel] = useState(1);
   const [workCost, setWorkCost] = useState(10);
   const [workCooldown, setWorkCooldown] = useState(false);
+  const [aiWorkEnabled, setAiWorkEnabled] = useState(false);
 
-  const [treasury, setTreasury] = useState(10000);
+  const [blueTreasury, setBlueTreasury] = useState(10000);
+  const [redTreasury, setRedTreasury] = useState(10000);
 
   const [bank, setBank] = useState(0);
   const [lastWithdraw, setLastWithdraw] = useState(0);
@@ -246,6 +280,15 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [messageInput, setMessageInput] = useState('');
 
+  const [botCooldownEnd, setBotCooldownEnd] = useState(0);
+  const [lastIncomeTimeBlue, setLastIncomeTimeBlue] = useState(Date.now());
+  const [lastIncomeTimeRed, setLastIncomeTimeRed] = useState(Date.now());
+
+  const [hoverX, setHoverX] = useState(-1);
+  const [hoverY, setHoverY] = useState(-1);
+
+  const [animations, setAnimations] = useState([]);
+
   // Аутентификация
   useEffect(() => {
     signInAnonymously(auth)
@@ -268,10 +311,16 @@ function App() {
       else set(ref(database, 'map'), generateMap());
     });
 
-    const treasuryRef = ref(database, 'treasury');
-    onValue(treasuryRef, (snap) => {
+    const blueTreasuryRef = ref(database, 'blueTreasury');
+    onValue(blueTreasuryRef, (snap) => {
       const val = snap.val();
-      setTreasury(val !== null ? val : 10000);
+      setBlueTreasury(val !== null ? val : 10000);
+    });
+
+    const redTreasuryRef = ref(database, 'redTreasury');
+    onValue(redTreasuryRef, (snap) => {
+      const val = snap.val();
+      setRedTreasury(val !== null ? val : 10000);
     });
 
     const globalWorkBonusRef = ref(database, 'globalWorkBonus');
@@ -307,6 +356,15 @@ function App() {
       setMessages(val ? Object.values(val) : []);
     });
 
+    const botCooldownEndRef = ref(database, 'botCooldownEnd');
+    onValue(botCooldownEndRef, (snap) => setBotCooldownEnd(snap.val() || 0));
+
+    const lastIncomeTimeBlueRef = ref(database, 'lastIncomeTimeBlue');
+    onValue(lastIncomeTimeBlueRef, (snap) => setLastIncomeTimeBlue(snap.val() || Date.now()));
+
+    const lastIncomeTimeRedRef = ref(database, 'lastIncomeTimeRed');
+    onValue(lastIncomeTimeRedRef, (snap) => setLastIncomeTimeRed(snap.val() || Date.now()));
+
   }, [user]);
 
   // Синхронизация personal states
@@ -336,6 +394,9 @@ function App() {
 
     const playerLossesRef = ref(database, `users/${user.uid}/playerLosses`);
     onValue(playerLossesRef, (snap) => setPlayerLosses(snap.val() || 0));
+
+    const aiWorkEnabledRef = ref(database, `users/${user.uid}/aiWorkEnabled`);
+    onValue(aiWorkEnabledRef, (snap) => setAiWorkEnabled(snap.val() || false));
 
   }, [user]);
 
@@ -396,9 +457,92 @@ function App() {
         }
         ctx.fillStyle = color;
         ctx.fillRect(x * PIXEL_SIZE, y * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
+
+        // Рисуем ресурсные клетки
+        if (map[y][x].resource) {
+          ctx.fillStyle = '#ffd700'; // gold
+          ctx.beginPath();
+          ctx.arc((x + 0.5) * PIXEL_SIZE, (y + 0.5) * PIXEL_SIZE, PIXEL_SIZE / 3, 0, 2 * Math.PI);
+          ctx.fill();
+        }
       }
     }
-  }, [map, zoom, offset, playerId, cooldown]);
+
+    // Подсветка для размещения
+    if ((placingBunker || placingArtillery) && hoverX >= 0 && hoverY >= 0) {
+      const alpha = 0.3;
+      const highlightColor = placingBunker ? 'rgba(0,255,0,0.3)' : 'rgba(255,0,0,0.3)';
+      let valid = true;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = hoverX + dx;
+          const ny = hoverY + dy;
+          if (nx < 0 || nx >= WIDTH || ny < 0 || ny >= HEIGHT) {
+            valid = false;
+            break;
+          }
+          if (placingBunker && map[ny][nx].id !== playerId) valid = false;
+          if (placingArtillery && map[ny][nx].id !== (playerId === 1 ? 2 : 1)) valid = false; // хотя бы одна вражеская
+        }
+        if (!valid) break;
+      }
+      if (valid || placingArtillery) { // для артиллерии показываем всегда, если в пределах
+        ctx.fillStyle = highlightColor;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const nx = hoverX + dx;
+            const ny = hoverY + dy;
+            if (nx >= 0 && nx < WIDTH && ny >= 0 && ny < HEIGHT) {
+              ctx.fillRect(nx * PIXEL_SIZE, ny * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
+            }
+          }
+        }
+      }
+    }
+
+    // Анимации вспышек
+    const currentTime = Date.now();
+    animations.forEach(anim => {
+      const elapsed = currentTime - anim.time;
+      if (elapsed < 500) { // 0.5 sec flash
+        const alpha = 1 - (elapsed / 500);
+        ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+        if (anim.type === 'artillery') {
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+              const nx = anim.x + dx;
+              const ny = anim.y + dy;
+              if (nx >= 0 && nx < WIDTH && ny >= 0 && ny < HEIGHT) {
+                ctx.fillRect(nx * PIXEL_SIZE, ny * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
+              }
+            }
+          }
+        } else {
+          ctx.fillRect(anim.x * PIXEL_SIZE, anim.y * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
+        }
+      }
+    });
+    setAnimations(prev => prev.filter(anim => currentTime - anim.time < 500));
+
+  }, [map, zoom, offset, playerId, cooldown, placingBunker, placingArtillery, hoverX, hoverY, animations]);
+
+  // Детект изменений карты для анимаций
+  useEffect(() => {
+    if (prevMapRef.current) {
+      const newAnimations = [];
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          if (map[y][x].id !== prevMapRef.current[y][x].id) {
+            newAnimations.push({ x, y, type: 'capture', time: Date.now() });
+          }
+        }
+      }
+      if (newAnimations.length > 0) {
+        setAnimations(prev => [...prev, ...newAnimations]);
+      }
+    }
+    prevMapRef.current = map;
+  }, [map]);
 
   // Проценты по депозиту каждые 5 сек
   useEffect(() => {
@@ -423,9 +567,140 @@ function App() {
     }
   }, [map]);
 
+  // Пассивный доход от ресурсов
+  useEffect(() => {
+    const interval = setInterval(() => {
+      // Для blue
+      runTransaction(ref(database, 'lastIncomeTimeBlue'), (current) => {
+        const periods = Math.floor((now - current) / 60000);
+        if (periods > 0) {
+          const income = periods * countResources(map, 1) * 500;
+          runTransaction(ref(database, 'blueTreasury'), (treas) => treas + income);
+          return current + periods * 60000;
+        }
+        return current;
+      });
+
+      // Для red
+      runTransaction(ref(database, 'lastIncomeTimeRed'), (current) => {
+        const periods = Math.floor((now - current) / 60000);
+        if (periods > 0) {
+          const income = periods * countResources(map, 2) * 500;
+          runTransaction(ref(database, 'redTreasury'), (treas) => treas + income);
+          return current + periods * 60000;
+        }
+        return current;
+      });
+    }, 10000); // check every 10s
+    return () => clearInterval(interval);
+  }, [now, map]);
+
+  // Логика бота для красной команды
+  useEffect(() => {
+    const botInterval = setInterval(tryBotAction, 5000); // try every 5s
+    return () => clearInterval(botInterval);
+  }, [map, redTreasury, botCooldownEnd, now]);
+
+  function tryBotAction() {
+    if (now < botCooldownEnd) return;
+
+    // Найти пограничные клетки для 2
+    const borders = [];
+    for (let y = 0; y < HEIGHT; y++) {
+      for (let x = 0; x < WIDTH; x++) {
+        if (isBorder(map, x, y, 2)) {
+          borders.push({x, y});
+        }
+      }
+    }
+    if (borders.length === 0) return;
+
+    // Выбрать случайную
+    const {x, y} = borders[Math.floor(Math.random() * borders.length)];
+
+    // Определить стоимость
+    const targetId = map[y][x].id;
+    const cost = targetId === 0 ? CAPTURE_NEUTRAL_COST : CAPTURE_ENEMY_COST;
+
+    if (redTreasury < cost) {
+      // Попробовать разместить бункер вместо
+      if (redTreasury >= BUNKER_COST) {
+        placeBotBunker();
+      }
+      return;
+    }
+
+    // Транзакция для кулдауна
+    runTransaction(ref(database, 'botCooldownEnd'), (current) => {
+      if (now >= current) {
+        // Захват
+        const newMap = map.map(row => row.map(cell => ({ ...cell })));
+        runTransaction(ref(database, 'redTreasury'), (treas) => treas - cost);
+        if (newMap[y][x].fort > 0) {
+          newMap[y][x].fort--;
+        } else {
+          newMap[y][x].id = 2;
+          newMap[y][x].fort = 0;
+        }
+        const withEnclaves = captureEnclaves(newMap, 2);
+        set(ref(database, 'map'), withEnclaves);
+        return now + 10000;
+      }
+      return current;
+    });
+  }
+
+  function placeBotBunker() {
+    // Найти случайную позицию на своей территории
+    const positions = [];
+    for (let y = 0; y < HEIGHT; y++) {
+      for (let x = WIDTH - 40; x < WIDTH; x++) { // near right
+        if (map[y][x].id === 2) {
+          positions.push({x, y});
+        }
+      }
+    }
+    if (positions.length === 0) return;
+
+    const {x, y} = positions[Math.floor(Math.random() * positions.length)];
+
+    runTransaction(ref(database, 'redTreasury'), (treas) => {
+      if (treas >= BUNKER_COST) {
+        const newMap = map.map(row => row.map(cell => ({ ...cell })));
+        addBunker(newMap, x, y, 2);
+        set(ref(database, 'map'), newMap);
+        return treas - BUNKER_COST;
+      }
+      return treas;
+    });
+  }
+
+  // AI work auto
+  useEffect(() => {
+    if (aiWorkEnabled) {
+      const workId = setInterval(handleWork, 3000);
+      return () => clearInterval(workId);
+    }
+  }, [aiWorkEnabled, workCooldown]);
+
+  // AI maintenance deduct
+  useEffect(() => {
+    if (aiWorkEnabled) {
+      const deductId = setInterval(() => {
+        if (balance >= AI_WORK_MAINTENANCE) {
+          set(ref(database, `users/${user.uid}/balance`), balance - AI_WORK_MAINTENANCE);
+        } else {
+          set(ref(database, `users/${user.uid}/aiWorkEnabled`), false);
+        }
+      }, 60000);
+      return () => clearInterval(deductId);
+    }
+  }, [aiWorkEnabled, balance, user]);
+
   function resetGame() {
     set(ref(database, 'map'), generateMap());
-    set(ref(database, 'treasury'), 10000);
+    set(ref(database, 'blueTreasury'), 10000);
+    set(ref(database, 'redTreasury'), 10000);
     set(ref(database, 'globalWorkBonus'), 0);
     set(ref(database, 'bankRate'), 0.0001);
     set(ref(database, 'bankUpgradeLevel'), 0);
@@ -436,6 +711,9 @@ function App() {
     set(ref(database, 'votes'), {});
     set(ref(database, 'votingEnd'), 0);
     set(ref(database, 'messages'), null); // Clear messages
+    set(ref(database, 'botCooldownEnd'), 0);
+    set(ref(database, 'lastIncomeTimeBlue'), Date.now());
+    set(ref(database, 'lastIncomeTimeRed'), Date.now());
 
     // Reset user data for all users? For simplicity, reset current user
     set(ref(database, `users/${user.uid}/balance`), 0);
@@ -445,6 +723,7 @@ function App() {
     set(ref(database, `users/${user.uid}/workLevel`), 1);
     set(ref(database, `users/${user.uid}/workCost`), 10);
     set(ref(database, `users/${user.uid}/playerLosses`), 0);
+    set(ref(database, `users/${user.uid}/aiWorkEnabled`), false);
     // Note: In a real app, you'd need to reset all users, perhaps with a server function.
   }
 
@@ -458,7 +737,19 @@ function App() {
     if (x < 0 || x >= WIDTH || y < 0 || y >= HEIGHT) return;
 
     if (placingBunker) {
-      if (map[y][x].id === playerId) {
+      let valid = true;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || nx >= WIDTH || ny < 0 || ny >= HEIGHT || map[ny][nx].id !== playerId) {
+            valid = false;
+            break;
+          }
+        }
+        if (!valid) break;
+      }
+      if (valid) {
         const newMap = map.map(row => row.map(cell => ({ ...cell })));
         addBunker(newMap, x, y, playerId);
         set(ref(database, 'map'), newMap);
@@ -471,6 +762,7 @@ function App() {
 
     if (placingArtillery) {
       const newMap = map.map(row => row.map(cell => ({ ...cell })));
+      let affected = false;
       for (let dy = -1; dy <= 1; dy++) {
         for (let dx = -1; dx <= 1; dx++) {
           const nx = x + dx;
@@ -485,17 +777,30 @@ function App() {
           ) {
             newMap[ny][nx].id = 0;
             newMap[ny][nx].fort = 0;
+            affected = true;
           }
         }
       }
-      set(ref(database, 'map'), newMap);
-      setPlacingArtillery(false);
+      if (affected) {
+        setAnimations(prev => [...prev, {x, y, type: 'artillery', time: Date.now()}]);
+        set(ref(database, 'map'), newMap);
+        setPlacingArtillery(false);
+      } else {
+        alert('Нет вражеских клеток в зоне');
+      }
       return;
     }
 
     if (cooldown) return;
 
     if (isBorder(map, x, y, playerId)) {
+      const targetId = map[y][x].id;
+      const cost = targetId === 0 ? CAPTURE_NEUTRAL_COST : CAPTURE_ENEMY_COST;
+      if (blueTreasury < cost) {
+        alert('Недостаточно средств в казне');
+        return;
+      }
+      set(ref(database, 'blueTreasury'), blueTreasury - cost);
       const newMap = map.map(row => row.map(cell => ({ ...cell })));
       if (newMap[y][x].fort > 0) {
         newMap[y][x].fort--;
@@ -504,10 +809,22 @@ function App() {
         newMap[y][x].fort = 0;
       }
       const withEnclaves = captureEnclaves(newMap, playerId);
+      setAnimations(prev => [...prev, {x, y, type: 'capture', time: Date.now()}]);
       set(ref(database, 'map'), withEnclaves);
       setCooldown(true);
       setTimeout(() => setCooldown(false), 10000);
     }
+  }
+
+  function handleMouseMoveOnCanvas(e) {
+    if (!placingBunker && !placingArtillery) return;
+    const rect = canvasRef.current.getBoundingClientRect();
+    const cx = (e.clientX - rect.left - offset.x) / zoom;
+    const cy = (e.clientY - rect.top - offset.y) / zoom;
+    const x = Math.floor(cx / PIXEL_SIZE);
+    const y = Math.floor(cy / PIXEL_SIZE);
+    setHoverX(x);
+    setHoverY(y);
   }
 
   function handleWheel(e) {
@@ -573,7 +890,7 @@ function App() {
     const net = profit - toTreasury;
     const toBank = Math.floor(net * 0.10);
 
-    set(ref(database, 'treasury'), treasury + toTreasury);
+    set(ref(database, 'blueTreasury'), blueTreasury + toTreasury);
     set(ref(database, `users/${user.uid}/bank`), bank + toBank);
     set(ref(database, `users/${user.uid}/balance`), balance + (net - toBank));
   }
@@ -583,6 +900,13 @@ function App() {
       set(ref(database, `users/${user.uid}/balance`), balance - workCost);
       set(ref(database, `users/${user.uid}/workLevel`), workLevel + 5);
       set(ref(database, `users/${user.uid}/workCost`), Math.ceil(workCost * 1.7));
+    }
+  }
+
+  function handleAiWorkUpgrade() {
+    if (balance >= AI_WORK_COST && !aiWorkEnabled) {
+      set(ref(database, `users/${user.uid}/balance`), balance - AI_WORK_COST);
+      set(ref(database, `users/${user.uid}/aiWorkEnabled`), true);
     }
   }
 
@@ -617,37 +941,37 @@ function App() {
     const amount = Number(donateInput);
     if (!Number.isFinite(amount) || amount <= 0 || balance < amount) return;
     set(ref(database, `users/${user.uid}/balance`), balance - amount);
-    set(ref(database, 'treasury'), treasury + amount);
+    set(ref(database, 'blueTreasury'), blueTreasury + amount);
     setDonateInput('');
   }
 
   function handleUpgradeBank() {
     if (bankRate >= BANK_MAX_RATE) return;
     const cost = BANK_UPGRADE_BASE_COST * (bankUpgradeLevel + 1);
-    if (treasury < cost) return;
-    set(ref(database, 'treasury'), treasury - cost);
+    if (blueTreasury < cost) return;
+    set(ref(database, 'blueTreasury'), blueTreasury - cost);
     set(ref(database, 'bankUpgradeLevel'), bankUpgradeLevel + 1);
     set(ref(database, 'bankRate'), bankRate + BANK_RATE_STEP);
   }
 
   function handleUpgradeWork() {
     const cost = WORK_UPGRADE_BASE_COST * (workUpgradeLevel + 1);
-    if (treasury < cost) return;
+    if (blueTreasury < cost) return;
     const increment = 25 * (workUpgradeLevel + 1);
-    set(ref(database, 'treasury'), treasury - cost);
+    set(ref(database, 'blueTreasury'), blueTreasury - cost);
     set(ref(database, 'workUpgradeLevel'), workUpgradeLevel + 1);
     set(ref(database, 'globalWorkBonus'), globalWorkBonus + increment);
   }
 
   function handleBuildBunker() {
-    if (treasury < BUNKER_COST) return;
-    set(ref(database, 'treasury'), treasury - BUNKER_COST);
+    if (blueTreasury < BUNKER_COST) return;
+    set(ref(database, 'blueTreasury'), blueTreasury - BUNKER_COST);
     setPlacingBunker(true);
   }
 
   function handleArtillery() {
-    if (treasury < ARTILLERY_COST) return;
-    set(ref(database, 'treasury'), treasury - ARTILLERY_COST);
+    if (blueTreasury < ARTILLERY_COST) return;
+    set(ref(database, 'blueTreasury'), blueTreasury - ARTILLERY_COST);
     setPlacingArtillery(true);
   }
 
@@ -756,7 +1080,8 @@ function App() {
     cursor: 'pointer',
     fontWeight: isActive ? 700 : 400,
     fontSize: 14,
-    outline: 'none'
+    outline: 'none',
+    transition: 'background 0.3s ease, color 0.3s ease, border-bottom 0.3s ease'
   });
 
   const presidencyLeftSec = president && presidencyEnd > now ? Math.max(0, Math.floor((presidencyEnd - now) / 1000)) : 0;
@@ -870,16 +1195,16 @@ function App() {
                 <div style={{ marginBottom: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                   <button
                     onClick={handleWork}
-                    disabled={workCooldown}
+                    disabled={workCooldown || aiWorkEnabled}
                     style={{
-                      background: workCooldown ? '#888' : '#2196f3',
+                      background: workCooldown || aiWorkEnabled ? '#888' : '#2196f3',
                       color: '#fff',
                       border: 'none',
                       borderRadius: 4,
                       padding: '8px 20px',
                       fontSize: 16,
                       fontWeight: 600,
-                      cursor: workCooldown ? 'not-allowed' : 'pointer'
+                      cursor: workCooldown || aiWorkEnabled ? 'not-allowed' : 'pointer'
                     }}
                   >
                     Работать! (+{workLevel + globalWorkBonus}$)
@@ -900,10 +1225,27 @@ function App() {
                   >
                     Прокачать ({workCost}$)
                   </button>
+                  <button
+                    onClick={handleAiWorkUpgrade}
+                    disabled={aiWorkEnabled || balance < AI_WORK_COST}
+                    style={{
+                      background: aiWorkEnabled || balance < AI_WORK_COST ? '#888' : '#4caf50',
+                      color: '#fff',
+                      border: 'none',
+                      borderRadius: 4,
+                      padding: '8px 20px',
+                      fontSize: 16,
+                      fontWeight: 600,
+                      cursor: aiWorkEnabled || balance < AI_WORK_COST ? 'not-allowed' : 'pointer'
+                    }}
+                  >
+                    ИИ-работа ({AI_WORK_COST}$)
+                  </button>
                 </div>
 
                 <div style={{ color: '#aaa', fontSize: 14, marginBottom: 16 }}>
-                  Уровень: <b>{workLevel}</b> · Бонус: <b>{globalWorkBonus}</b> · Казна: <b style={{ color: '#ffe259' }}>{treasury.toFixed(2)}$</b>
+                  Уровень: <b>{workLevel}</b> · Бонус: <b>{globalWorkBonus}</b> · Казна: <b style={{ color: '#ffe259' }}>{blueTreasury.toFixed(2)}$</b>
+                  {aiWorkEnabled && <span> · ИИ активен (обслуживание 200$/мин)</span>}
                 </div>
 
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 16 }}>
@@ -1007,7 +1349,7 @@ function App() {
             {activeTab === 'politics' && (
               <div>
                 <div style={{ marginBottom: 8 }}>
-                  <b>Казна:</b> <span style={{ color: '#ffe259', fontWeight: 700 }}>{treasury.toFixed(2)}$</span>
+                  <b>Казна:</b> <span style={{ color: '#ffe259', fontWeight: 700 }}>{blueTreasury.toFixed(2)}$</span>
                 </div>
                 <div style={{ marginBottom: 8 }}>
                   <b>Имя:</b>{' '}
@@ -1172,17 +1514,17 @@ function App() {
                   <b>Вы — президент!</b> Срок: {presidencyLeftSec > 0 ? fmtTime(presidencyLeftSec) : 'истёк'}
                 </div>
                 <div style={{ marginBottom: 8 }}>
-                  <b>Казна:</b> <span style={{ color: '#ffe259', fontWeight: 700 }}>{treasury.toFixed(2)}$</span>
+                  <b>Казна:</b> <span style={{ color: '#ffe259', fontWeight: 700 }}>{blueTreasury.toFixed(2)}$</span>
                 </div>
                 <div style={{ marginBottom: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
                   <div style={{ fontSize: 14 }}>
                     <b>Банк:</b> Ур. {bankUpgradeLevel}, ставка {(bankRate * 100).toFixed(2)}%
                     <button
                       onClick={handleUpgradeBank}
-                      disabled={bankRate >= BANK_MAX_RATE || treasury < BANK_UPGRADE_BASE_COST * (bankUpgradeLevel + 1)}
+                      disabled={bankRate >= BANK_MAX_RATE || blueTreasury < BANK_UPGRADE_BASE_COST * (bankUpgradeLevel + 1)}
                       style={{
                         background:
-                          bankRate >= BANK_MAX_RATE || treasury < BANK_UPGRADE_BASE_COST * (bankUpgradeLevel + 1)
+                          bankRate >= BANK_MAX_RATE || blueTreasury < BANK_UPGRADE_BASE_COST * (bankUpgradeLevel + 1)
                             ? '#888'
                             : '#2196f3',
                         color: '#fff',
@@ -1192,7 +1534,7 @@ function App() {
                         marginLeft: 8,
                         fontWeight: 600,
                         cursor:
-                          bankRate >= BANK_MAX_RATE || treasury < BANK_UPGRADE_BASE_COST * (bankUpgradeLevel + 1)
+                          bankRate >= BANK_MAX_RATE || blueTreasury < BANK_UPGRADE_BASE_COST * (bankUpgradeLevel + 1)
                             ? 'not-allowed'
                             : 'pointer',
                         fontSize: 12
@@ -1205,16 +1547,16 @@ function App() {
                     <b>Работа:</b> Ур. {workUpgradeLevel}, бонус {globalWorkBonus}$
                     <button
                       onClick={handleUpgradeWork}
-                      disabled={treasury < WORK_UPGRADE_BASE_COST * (workUpgradeLevel + 1)}
+                      disabled={blueTreasury < WORK_UPGRADE_BASE_COST * (workUpgradeLevel + 1)}
                       style={{
-                        background: treasury < WORK_UPGRADE_BASE_COST * (workUpgradeLevel + 1) ? '#888' : '#2196f3',
+                        background: blueTreasury < WORK_UPGRADE_BASE_COST * (workUpgradeLevel + 1) ? '#888' : '#2196f3',
                         color: '#fff',
                         border: 'none',
                         borderRadius: 4,
                         padding: '4px 12px',
                         marginLeft: 8,
                         fontWeight: 600,
-                        cursor: treasury < WORK_UPGRADE_BASE_COST * (workUpgradeLevel + 1) ? 'not-allowed' : 'pointer',
+                        cursor: blueTreasury < WORK_UPGRADE_BASE_COST * (workUpgradeLevel + 1) ? 'not-allowed' : 'pointer',
                         fontSize: 12
                       }}
                     >
@@ -1225,16 +1567,16 @@ function App() {
                     <b>Бункер:</b> Укрепляет 3x3
                     <button
                       onClick={handleBuildBunker}
-                      disabled={treasury < BUNKER_COST}
+                      disabled={blueTreasury < BUNKER_COST}
                       style={{
-                        background: treasury < BUNKER_COST ? '#888' : '#2196f3',
+                        background: blueTreasury < BUNKER_COST ? '#888' : '#2196f3',
                         color: '#fff',
                         border: 'none',
                         borderRadius: 4,
                         padding: '4px 12px',
                         marginLeft: 8,
                         fontWeight: 600,
-                        cursor: treasury < BUNKER_COST ? 'not-allowed' : 'pointer',
+                        cursor: blueTreasury < BUNKER_COST ? 'not-allowed' : 'pointer',
                         fontSize: 12
                       }}
                     >
@@ -1245,16 +1587,16 @@ function App() {
                     <b>Артиллерия:</b> Нейтрализует 3x3 врага
                     <button
                       onClick={handleArtillery}
-                      disabled={treasury < ARTILLERY_COST}
+                      disabled={blueTreasury < ARTILLERY_COST}
                       style={{
-                        background: treasury < ARTILLERY_COST ? '#888' : '#f44336',
+                        background: blueTreasury < ARTILLERY_COST ? '#888' : '#f44336',
                         color: '#fff',
                         border: 'none',
                         borderRadius: 4,
                         padding: '4px 12px',
                         marginLeft: 8,
                         fontWeight: 600,
-                        cursor: treasury < ARTILLERY_COST ? 'not-allowed' : 'pointer',
+                        cursor: blueTreasury < ARTILLERY_COST ? 'not-allowed' : 'pointer',
                         fontSize: 12
                       }}
                     >
@@ -1305,18 +1647,17 @@ function App() {
       >
         <canvas
           ref={canvasRef}
-          width={WIDTH * PIXEL_SIZE}
-          height={HEIGHT * PIXEL_SIZE}
+          width={window.innerWidth}
+          height={window.innerHeight}
           style={{
             display: 'block',
             position: 'absolute',
             left: 0,
             top: 0,
-            width: WIDTH * PIXEL_SIZE,
-            height: HEIGHT * PIXEL_SIZE,
             cursor: dragging.current ? 'grabbing' : 'default'
           }}
           onClick={handleCanvasClick}
+          onMouseMove={handleMouseMoveOnCanvas}
           onMouseDown={handleMouseDown}
           onContextMenu={handleContextMenu}
         />
