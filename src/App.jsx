@@ -35,7 +35,7 @@ const PIXEL_SIZE = 6;
  */
 function generateMap() {
   const map = Array.from({ length: HEIGHT }, () =>
-    Array.from({ length: WIDTH }, (_, x) => ({ id: x < 20 ? 1 : x > WIDTH - 21 ? 2 : 0, fort: 0, resource: false }))
+    Array.from({ length: WIDTH }, (_, x) => ({ id: x < 20 ? 1 : x > WIDTH - 21 ? 2 : 0, fort: 0, resource: false, building: 'none' }))
   );
 
   // Изначальные бункеры для красной команды (игрок 2)
@@ -79,6 +79,25 @@ function addBunker(map, cx, cy, playerId) {
         map[y][x].fort += 1;
       }
     }
+  }
+}
+
+/**
+ * Функция для добавления стены (устанавливает building='wall' и fort=3 на одной клетке)
+ */
+function addWall(map, x, y, playerId) {
+  if (map[y][x].id === playerId && map[y][x].building === 'none') {
+    map[y][x].building = 'wall';
+    map[y][x].fort = 3;
+  }
+}
+
+/**
+ * Функция для добавления фабрики (устанавливает building='factory' на одной клетке)
+ */
+function addFactory(map, x, y, playerId) {
+  if (map[y][x].id === playerId && map[y][x].building === 'none') {
+    map[y][x].building = 'factory';
   }
 }
 
@@ -139,6 +158,7 @@ function captureEnclaves(map, playerId) {
           for (const [ax, ay] of area) {
             newMap[ay][ax].id = playerId;
             newMap[ay][ax].fort = 0;
+            // Building remains, e.g., factory transfers to new owner
           }
         }
       }
@@ -178,6 +198,19 @@ function countResources(map, playerId) {
 }
 
 /**
+ * Подсчёт фабрик для команды
+ */
+function countFactories(map, playerId) {
+  let count = 0;
+  for (let y = 0; y < HEIGHT; y++) {
+    for (let x = 0; x < WIDTH; x++) {
+      if (map[y][x].id === playerId && map[y][x].building === 'factory') count++;
+    }
+  }
+  return count;
+}
+
+/**
  * --- Цвета ---
  */
 const colors = {
@@ -191,8 +224,7 @@ const colors = {
 /**
  * Функция для затемнения цвета
  */
-function darken(hex) {
-  const factor = 0.7;
+function darken(hex, factor = 0.7) {
   const r = Math.floor(parseInt(hex.slice(1, 3), 16) * factor);
   const g = Math.floor(parseInt(hex.slice(3, 5), 16) * factor);
   const b = Math.floor(parseInt(hex.slice(5, 7), 16) * factor);
@@ -213,6 +245,8 @@ const TABS = [
  * Константы для улучшений
  */
 const BUNKER_COST = 5000;
+const WALL_COST = 3500;
+const FACTORY_COST = 1500;
 const BANK_UPGRADE_BASE_COST = 1000;
 const WORK_UPGRADE_BASE_COST = 2000;
 const BANK_RATE_STEP = 0.0001; // +0.01%
@@ -222,6 +256,7 @@ const AI_WORK_COST = 20000;
 const AI_WORK_MAINTENANCE = 200; // per minute
 const CAPTURE_NEUTRAL_COST = 50;
 const CAPTURE_ENEMY_COST = 100;
+const FACTORY_INCOME = 20; // per minute per factory
 
 function App() {
   const playerId = 1;
@@ -231,6 +266,8 @@ function App() {
   const [cooldown, setCooldown] = useState(false);
   const [placingBunker, setPlacingBunker] = useState(false);
   const [placingArtillery, setPlacingArtillery] = useState(false);
+  const [placingWall, setPlacingWall] = useState(false);
+  const [placingFactory, setPlacingFactory] = useState(false);
 
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
@@ -438,8 +475,8 @@ function App() {
     }
   }, [now, votingEnd, president, presidencyEnd]);
 
-  // Рисуем карту на canvas
-  useEffect(() => {
+  // Оптимизированный рендеринг карты с requestAnimationFrame
+  const drawMap = useCallback(() => {
     if (!canvasRef.current) return;
     const ctx = canvasRef.current.getContext('2d');
     ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -455,6 +492,9 @@ function App() {
         if (map[y][x].fort > 0) {
           color = darken(color);
         }
+        if (map[y][x].building === 'wall') {
+          color = darken(color, 0.5); // Темнее чем бункер
+        }
         ctx.fillStyle = color;
         ctx.fillRect(x * PIXEL_SIZE, y * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
 
@@ -465,49 +505,55 @@ function App() {
           ctx.arc((x + 0.5) * PIXEL_SIZE, (y + 0.5) * PIXEL_SIZE, PIXEL_SIZE / 3, 0, 2 * Math.PI);
           ctx.fill();
         }
+
+        // Рисуем значок фабрики
+        if (map[y][x].building === 'factory') {
+          ctx.fillStyle = '#808080'; // gray for factory icon
+          ctx.fillRect(x * PIXEL_SIZE + PIXEL_SIZE / 4, y * PIXEL_SIZE + PIXEL_SIZE / 4, PIXEL_SIZE / 2, PIXEL_SIZE / 2);
+        }
       }
     }
 
     // Подсветка для размещения
-    if ((placingBunker || placingArtillery) && hoverX >= 0 && hoverY >= 0) {
-      const alpha = 0.3;
-      const highlightColor = placingBunker ? 'rgba(0,255,0,0.3)' : 'rgba(255,0,0,0.3)';
+    if ((placingBunker || placingArtillery || placingWall || placingFactory) && hoverX >= 0 && hoverY >= 0) {
+      let highlightColor = 'rgba(0,255,0,0.3)';
+      if (placingArtillery) highlightColor = 'rgba(255,0,0,0.3)';
+      if (placingWall) highlightColor = 'rgba(128,128,128,0.3)';
+      if (placingFactory) highlightColor = 'rgba(0,0,255,0.3)';
       let valid = true;
-      for (let dy = -1; dy <= 1; dy++) {
-        for (let dx = -1; dx <= 1; dx++) {
-          const nx = hoverX + dx;
-          const ny = hoverY + dy;
-          if (nx < 0 || nx >= WIDTH || ny < 0 || ny >= HEIGHT) {
-            valid = false;
-            break;
-          }
-          if (placingBunker && map[ny][nx].id !== playerId) valid = false;
-          if (placingArtillery && map[ny][nx].id !== (playerId === 1 ? 2 : 1)) valid = false; // хотя бы одна вражеская
-        }
-        if (!valid) break;
+      let area = [];
+      if (placingBunker || placingArtillery) {
+        area = Array.from({length: 3}, (_, dy) => Array.from({length: 3}, (_, dx) => [hoverX + dx - 1, hoverY + dy - 1])).flat();
+      } else {
+        area = [[hoverX, hoverY]];
       }
-      if (valid || placingArtillery) { // для артиллерии показываем всегда, если в пределах
+      for (const [nx, ny] of area) {
+        if (nx < 0 || nx >= WIDTH || ny < 0 || ny >= HEIGHT) {
+          valid = false;
+          break;
+        }
+        if ((placingBunker || placingWall || placingFactory) && map[ny][nx].id !== playerId) valid = false;
+        if (placingArtillery && map[ny][nx].id !== (playerId === 1 ? 2 : 1)) valid = false;
+        if ((placingWall || placingFactory) && map[ny][nx].building !== 'none') valid = false;
+      }
+      if (valid || placingArtillery) {
         ctx.fillStyle = highlightColor;
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            const nx = hoverX + dx;
-            const ny = hoverY + dy;
-            if (nx >= 0 && nx < WIDTH && ny >= 0 && ny < HEIGHT) {
-              ctx.fillRect(nx * PIXEL_SIZE, ny * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
-            }
+        for (const [nx, ny] of area) {
+          if (nx >= 0 && nx < WIDTH && ny >= 0 && ny < HEIGHT) {
+            ctx.fillRect(nx * PIXEL_SIZE, ny * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
           }
         }
       }
     }
 
-    // Анимации вспышек
+    // Улучшенные анимации вспышек (с пульсацией)
     const currentTime = Date.now();
     animations.forEach(anim => {
       const elapsed = currentTime - anim.time;
-      if (elapsed < 500) { // 0.5 sec flash
-        const alpha = 1 - (elapsed / 500);
+      if (elapsed < 1000) { // 1 sec animation
+        const alpha = Math.sin((elapsed / 1000) * Math.PI) * 0.8; // pulse
         ctx.fillStyle = `rgba(255,255,255,${alpha})`;
-        if (anim.type === 'artillery') {
+        if (anim.type === 'artillery' || anim.type === 'bunker') {
           for (let dy = -1; dy <= 1; dy++) {
             for (let dx = -1; dx <= 1; dx++) {
               const nx = anim.x + dx;
@@ -522,9 +568,13 @@ function App() {
         }
       }
     });
-    setAnimations(prev => prev.filter(anim => currentTime - anim.time < 500));
+    setAnimations(prev => prev.filter(anim => currentTime - anim.time < 1000));
+  }, [map, zoom, offset, playerId, cooldown, placingBunker, placingArtillery, placingWall, placingFactory, hoverX, hoverY, animations]);
 
-  }, [map, zoom, offset, playerId, cooldown, placingBunker, placingArtillery, hoverX, hoverY, animations]);
+  useEffect(() => {
+    const animId = requestAnimationFrame(drawMap);
+    return () => cancelAnimationFrame(animId);
+  }, [drawMap]);
 
   // Детект изменений карты для анимаций
   useEffect(() => {
@@ -532,7 +582,7 @@ function App() {
       const newAnimations = [];
       for (let y = 0; y < HEIGHT; y++) {
         for (let x = 0; x < WIDTH; x++) {
-          if (map[y][x].id !== prevMapRef.current[y][x].id) {
+          if (map[y][x].id !== prevMapRef.current[y][x].id || map[y][x].fort !== prevMapRef.current[y][x].fort || map[y][x].building !== prevMapRef.current[y][x].building) {
             newAnimations.push({ x, y, type: 'capture', time: Date.now() });
           }
         }
@@ -567,15 +617,16 @@ function App() {
     }
   }, [map]);
 
-  // Пассивный доход от ресурсов
+  // Пассивный доход от ресурсов и фабрик
   useEffect(() => {
     const interval = setInterval(() => {
       // Для blue
       runTransaction(ref(database, 'lastIncomeTimeBlue'), (current) => {
         const periods = Math.floor((now - current) / 60000);
         if (periods > 0) {
-          const income = periods * countResources(map, 1) * 500;
-          runTransaction(ref(database, 'blueTreasury'), (treas) => treas + income);
+          const resourceIncome = periods * countResources(map, 1) * 500;
+          const factoryIncome = periods * countFactories(map, 1) * FACTORY_INCOME;
+          runTransaction(ref(database, 'blueTreasury'), (treas) => treas + resourceIncome + factoryIncome);
           return current + periods * 60000;
         }
         return current;
@@ -585,8 +636,9 @@ function App() {
       runTransaction(ref(database, 'lastIncomeTimeRed'), (current) => {
         const periods = Math.floor((now - current) / 60000);
         if (periods > 0) {
-          const income = periods * countResources(map, 2) * 500;
-          runTransaction(ref(database, 'redTreasury'), (treas) => treas + income);
+          const resourceIncome = periods * countResources(map, 2) * 500;
+          const factoryIncome = periods * countFactories(map, 2) * FACTORY_INCOME;
+          runTransaction(ref(database, 'redTreasury'), (treas) => treas + resourceIncome + factoryIncome);
           return current + periods * 60000;
         }
         return current;
@@ -752,10 +804,37 @@ function App() {
       if (valid) {
         const newMap = map.map(row => row.map(cell => ({ ...cell })));
         addBunker(newMap, x, y, playerId);
+        setAnimations(prev => [...prev, {x, y, type: 'bunker', time: Date.now()}]);
         set(ref(database, 'map'), newMap);
         setPlacingBunker(false);
       } else {
         alert('Можно строить только на своей территории');
+      }
+      return;
+    }
+
+    if (placingWall) {
+      if (map[y][x].id === playerId && map[y][x].building === 'none') {
+        const newMap = map.map(row => row.map(cell => ({ ...cell })));
+        addWall(newMap, x, y, playerId);
+        setAnimations(prev => [...prev, {x, y, type: 'capture', time: Date.now()}]);
+        set(ref(database, 'map'), newMap);
+        setPlacingWall(false);
+      } else {
+        alert('Можно строить только на своей территории без построек');
+      }
+      return;
+    }
+
+    if (placingFactory) {
+      if (map[y][x].id === playerId && map[y][x].building === 'none') {
+        const newMap = map.map(row => row.map(cell => ({ ...cell })));
+        addFactory(newMap, x, y, playerId);
+        setAnimations(prev => [...prev, {x, y, type: 'capture', time: Date.now()}]);
+        set(ref(database, 'map'), newMap);
+        setPlacingFactory(false);
+      } else {
+        alert('Можно строить только на своей территории без построек');
       }
       return;
     }
@@ -777,6 +856,7 @@ function App() {
           ) {
             newMap[ny][nx].id = 0;
             newMap[ny][nx].fort = 0;
+            newMap[ny][nx].building = 'none'; // Стена или фабрика уничтожается
             affected = true;
           }
         }
@@ -804,6 +884,9 @@ function App() {
       const newMap = map.map(row => row.map(cell => ({ ...cell })));
       if (newMap[y][x].fort > 0) {
         newMap[y][x].fort--;
+        if (newMap[y][x].fort === 0 && newMap[y][x].building === 'wall') {
+          newMap[y][x].building = 'none';
+        }
       } else {
         newMap[y][x].id = playerId;
         newMap[y][x].fort = 0;
@@ -817,7 +900,7 @@ function App() {
   }
 
   function handleMouseMoveOnCanvas(e) {
-    if (!placingBunker && !placingArtillery) return;
+    if (!placingBunker && !placingArtillery && !placingWall && !placingFactory) return;
     const rect = canvasRef.current.getBoundingClientRect();
     const cx = (e.clientX - rect.left - offset.x) / zoom;
     const cy = (e.clientY - rect.top - offset.y) / zoom;
@@ -967,6 +1050,18 @@ function App() {
     if (blueTreasury < BUNKER_COST) return;
     set(ref(database, 'blueTreasury'), blueTreasury - BUNKER_COST);
     setPlacingBunker(true);
+  }
+
+  function handleBuildWall() {
+    if (blueTreasury < WALL_COST) return;
+    set(ref(database, 'blueTreasury'), blueTreasury - WALL_COST);
+    setPlacingWall(true);
+  }
+
+  function handleBuildFactory() {
+    if (blueTreasury < FACTORY_COST) return;
+    set(ref(database, 'blueTreasury'), blueTreasury - FACTORY_COST);
+    setPlacingFactory(true);
   }
 
   function handleArtillery() {
@@ -1132,23 +1227,42 @@ function App() {
         }}
       >
         <h2 style={{ color: '#fff', margin: '0 16px', fontSize: 20 }}>Пиксельная карта</h2>
-        <button
-          style={{
-            background: menuOpen ? '#ffe259' : '#333',
-            color: menuOpen ? '#222' : '#fff',
-            border: 'none',
-            borderRadius: 4,
-            padding: '6px 16px',
-            fontSize: 15,
-            fontWeight: 600,
-            marginRight: 16,
-            cursor: 'pointer',
-            transition: 'background 0.2s'
-          }}
-          onClick={() => setMenuOpen(v => !v)}
-        >
-          Меню
-        </button>
+        <div style={{ display: 'flex', gap: 8, marginRight: 16 }}>
+          <button
+            style={{
+              background: menuOpen ? '#ffe259' : '#333',
+              color: menuOpen ? '#222' : '#fff',
+              border: 'none',
+              borderRadius: 4,
+              padding: '6px 16px',
+              fontSize: 15,
+              fontWeight: 600,
+              cursor: 'pointer',
+              transition: 'background 0.2s'
+            }}
+            onClick={() => setMenuOpen(v => !v)}
+          >
+            Меню
+          </button>
+          {username === 'Admin' && (
+            <button
+              style={{
+                background: '#f44336',
+                color: '#fff',
+                border: 'none',
+                borderRadius: 4,
+                padding: '6px 16px',
+                fontSize: 15,
+                fontWeight: 600,
+                cursor: 'pointer',
+                transition: 'background 0.2s'
+              }}
+              onClick={resetGame}
+            >
+              Рестарт
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Меню вкладок (оверлей) */}
@@ -1581,6 +1695,46 @@ function App() {
                       }}
                     >
                       Построить ({BUNKER_COST}$)
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 14 }}>
+                    <b>Стена:</b> Укрепляет 1 клетку (3 HP)
+                    <button
+                      onClick={handleBuildWall}
+                      disabled={blueTreasury < WALL_COST}
+                      style={{
+                        background: blueTreasury < WALL_COST ? '#888' : '#2196f3',
+                        color: '#fff',
+                        border: 'none',
+                        borderRadius: 4,
+                        padding: '4px 12px',
+                        marginLeft: 8,
+                        fontWeight: 600,
+                        cursor: blueTreasury < WALL_COST ? 'not-allowed' : 'pointer',
+                        fontSize: 12
+                      }}
+                    >
+                      Построить ({WALL_COST}$)
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 14 }}>
+                    <b>Фабрика:</b> +20$/мин в казну
+                    <button
+                      onClick={handleBuildFactory}
+                      disabled={blueTreasury < FACTORY_COST}
+                      style={{
+                        background: blueTreasury < FACTORY_COST ? '#888' : '#2196f3',
+                        color: '#fff',
+                        border: 'none',
+                        borderRadius: 4,
+                        padding: '4px 12px',
+                        marginLeft: 8,
+                        fontWeight: 600,
+                        cursor: blueTreasury < FACTORY_COST ? 'not-allowed' : 'pointer',
+                        fontSize: 12
+                      }}
+                    >
+                      Построить ({FACTORY_COST}$)
                     </button>
                   </div>
                   <div style={{ fontSize: 14 }}>
