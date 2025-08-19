@@ -1,27 +1,1348 @@
+import React, { useState, useRef, useEffect } from 'react';
 import './App.css';
+import { initializeApp } from "firebase/app";
+import { getDatabase, ref, onValue, set, push } from "firebase/database";
+import { getAuth, signInAnonymously } from "firebase/auth";
+import { getAnalytics } from "firebase/analytics";
+
+// Your web app's Firebase configuration
+const firebaseConfig = {
+  apiKey: "AIzaSyAWjienwezNfIafxbSGGaZ9Aefo8n-_X3U",
+  authDomain: "warpixel-5d49a.firebaseapp.com",
+  projectId: "warpixel-5d49a",
+  storageBucket: "warpixel-5d49a.firebasestorage.app",
+  messagingSenderId: "178465479901",
+  appId: "1:178465479901:web:533caafe0b021406eb8f34",
+  measurementId: "G-E4WJQ4WSVZ"
+};
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+const analytics = getAnalytics(app);
+const database = getDatabase(app);
+const auth = getAuth(app);
+
+/**
+ * --- Константы карты ---
+ */
+const WIDTH = 320;
+const HEIGHT = 192;
+const PIXEL_SIZE = 6;
+
+/**
+ * Карта: слева 20 колонок — игрок (1), справа 20 — соперник (2), середина — нейтраль (0)
+ */
+function generateMap() {
+  const map = Array.from({ length: HEIGHT }, () =>
+    Array.from({ length: WIDTH }, (_, x) => ({ id: x < 20 ? 1 : x > WIDTH - 21 ? 2 : 0, fort: 0 }))
+  );
+
+  // Изначальные бункеры для красной команды (игрок 2)
+  addBunker(map, WIDTH - 30, 30, 2);
+  addBunker(map, WIDTH - 30, Math.floor(HEIGHT / 2), 2);
+  addBunker(map, WIDTH - 30, HEIGHT - 30, 2);
+
+  return map;
+}
+
+/**
+ * Функция для добавления бункера (увеличивает fort в радиусе 1 для 3x3)
+ */
+function addBunker(map, cx, cy, playerId) {
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const x = cx + dx;
+      const y = cy + dy;
+      if (
+        x >= 0 &&
+        x < WIDTH &&
+        y >= 0 &&
+        y < HEIGHT &&
+        Math.max(Math.abs(dx), Math.abs(dy)) <= 1 &&
+        map[y][x].id === playerId
+      ) {
+        map[y][x].fort += 1;
+      }
+    }
+  }
+}
+
+/**
+ * Является ли клетка «пограничной» для клика (4-соседство)
+ */
+function isBorder(map, x, y, playerId) {
+  if (map[y][x].id === playerId) return false;
+  const dirs = [[0, 1], [1, 0], [0, -1], [-1, 0]];
+  return dirs.some(([dx, dy]) => {
+    const nx = x + dx,
+      ny = y + dy;
+    return nx >= 0 && nx < WIDTH && ny >= 0 && ny < HEIGHT && map[ny][nx].id === playerId;
+  });
+}
+
+/**
+ * Автозахват анклавов после окраски (любая замкнутая область 0/вражеских — становится нашей)
+ */
+function captureEnclaves(map, playerId) {
+  const visited = Array.from({ length: HEIGHT }, () => Array(WIDTH).fill(false));
+  const newMap = map.map(row => row.map(cell => ({ ...cell })));
+  const targetIds = playerId === 1 ? [0, 2] : [0, 1];
+
+  function bfs(sx, sy) {
+    const queue = [[sx, sy]];
+    const area = [[sx, sy]];
+    visited[sy][sx] = true;
+    let isEnclave = true;
+
+    while (queue.length) {
+      const [x, y] = queue.pop();
+      for (const [dx, dy] of [[0, 1], [1, 0], [0, -1], [-1, 0]]) {
+        const nx = x + dx,
+          ny = y + dy;
+        if (nx < 0 || nx >= WIDTH || ny < 0 || ny >= HEIGHT) {
+          isEnclave = false;
+          continue;
+        }
+        if (!visited[ny][nx] && targetIds.includes(map[ny][nx].id)) {
+          visited[ny][nx] = true;
+          queue.push([nx, ny]);
+          area.push([nx, ny]);
+        }
+        if (!targetIds.includes(map[ny][nx].id) && map[ny][nx].id !== playerId) {
+          isEnclave = false;
+        }
+      }
+    }
+    return isEnclave ? area : [];
+  }
+
+  for (let y = 0; y < HEIGHT; y++) {
+    for (let x = 0; x < WIDTH; x++) {
+      if (!visited[y][x] && targetIds.includes(map[y][x].id)) {
+        const area = bfs(x, y);
+        if (area.length) {
+          for (const [ax, ay] of area) {
+            newMap[ay][ax].id = playerId;
+            newMap[ay][ax].fort = 0;
+          }
+        }
+      }
+    }
+  }
+  return newMap;
+}
+
+/**
+ * Подсчёт клеток для статистики «Война»
+ */
+function countCells(m) {
+  let p1 = 0,
+    p2 = 0,
+    neutral = 0;
+  for (let y = 0; y < HEIGHT; y++) {
+    for (let x = 0; x < WIDTH; x++) {
+      if (m[y][x].id === 1) p1++;
+      else if (m[y][x].id === 2) p2++;
+      else neutral++;
+    }
+  }
+  return { p1, p2, neutral, total: WIDTH * HEIGHT };
+}
+
+/**
+ * --- Цвета ---
+ */
+const colors = {
+  0: '#222',
+  1: '#2196f3', // синий — игрок
+  2: '#f44336', // красный — соперник
+  border: '#ffe259', // жёлтый — можно захватить
+  borderDisabled: '#888' // серый — во время кулдауна
+};
+
+/**
+ * Функция для затемнения цвета
+ */
+function darken(hex) {
+  const factor = 0.7;
+  const r = Math.floor(parseInt(hex.slice(1, 3), 16) * factor);
+  const g = Math.floor(parseInt(hex.slice(3, 5), 16) * factor);
+  const b = Math.floor(parseInt(hex.slice(5, 7), 16) * factor);
+  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+}
+
+/**
+ * --- Вкладки ---
+ */
+const TABS = [
+  { key: 'work', label: 'Работа' },
+  { key: 'war', label: 'Война' },
+  { key: 'politics', label: 'Политика' },
+  { key: 'chat', label: 'Чат' }
+];
+
+/**
+ * Константы для улучшений
+ */
+const BUNKER_COST = 5000;
+const BANK_UPGRADE_BASE_COST = 1000;
+const WORK_UPGRADE_BASE_COST = 2000;
+const BANK_RATE_STEP = 0.0001; // +0.01%
+const BANK_MAX_RATE = 0.05; // 5%
+const ARTILLERY_COST = 5000;
 
 function App() {
+  const playerId = 1;
+  const [user, setUser] = useState(null);
+  const [map, setMap] = useState(generateMap());
+  const [cooldown, setCooldown] = useState(false);
+  const [placingBunker, setPlacingBunker] = useState(false);
+  const [placingArtillery, setPlacingArtillery] = useState(false);
+
+  const [zoom, setZoom] = useState(1);
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const dragging = useRef(false);
+  const lastPos = useRef({ x: 0, y: 0 });
+  const containerRef = useRef(null);
+  const canvasRef = useRef(null);
+
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState(TABS[0].key);
+
+  const [balance, setBalance] = useState(0);
+  const [workLevel, setWorkLevel] = useState(1);
+  const [workCost, setWorkCost] = useState(10);
+  const [workCooldown, setWorkCooldown] = useState(false);
+
+  const [treasury, setTreasury] = useState(10000);
+
+  const [bank, setBank] = useState(0);
+  const [lastWithdraw, setLastWithdraw] = useState(0);
+  const [depositInput, setDepositInput] = useState('');
+  const [withdrawInput, setWithdrawInput] = useState('');
+  const [donateInput, setDonateInput] = useState('');
+
+  const [globalWorkBonus, setGlobalWorkBonus] = useState(0);
+  const [bankRate, setBankRate] = useState(0.0001);
+  const [bankUpgradeLevel, setBankUpgradeLevel] = useState(0);
+  const [workUpgradeLevel, setWorkUpgradeLevel] = useState(0);
+
+  const [president, setPresident] = useState('');
+  const [presidencyEnd, setPresidencyEnd] = useState(0);
+
+  const [username, setUsername] = useState('');
+  const [candidates, setCandidates] = useState([]);
+  const [votes, setVotes] = useState({});
+  const [voted, setVoted] = useState(false);
+
+  const [now, setNow] = useState(Date.now());
+  const [votingEnd, setVotingEnd] = useState(0);
+
+  const initialPlayerCellsRef = useRef(20 * HEIGHT);
+
+  const [playerLosses, setPlayerLosses] = useState(0);
+
+  const [messages, setMessages] = useState([]);
+  const [messageInput, setMessageInput] = useState('');
+
+  // Аутентификация
+  useEffect(() => {
+    signInAnonymously(auth)
+      .then((userCredential) => {
+        setUser(userCredential.user);
+      })
+      .catch((error) => {
+        console.error("Authentication error:", error);
+      });
+  }, []);
+
+  // Синхронизация shared states
+  useEffect(() => {
+    if (!user) return;
+
+    const mapRef = ref(database, 'map');
+    onValue(mapRef, (snap) => {
+      const val = snap.val();
+      if (val) setMap(val);
+      else set(ref(database, 'map'), generateMap());
+    });
+
+    const treasuryRef = ref(database, 'treasury');
+    onValue(treasuryRef, (snap) => {
+      const val = snap.val();
+      setTreasury(val !== null ? val : 10000);
+    });
+
+    const globalWorkBonusRef = ref(database, 'globalWorkBonus');
+    onValue(globalWorkBonusRef, (snap) => setGlobalWorkBonus(snap.val() || 0));
+
+    const bankRateRef = ref(database, 'bankRate');
+    onValue(bankRateRef, (snap) => setBankRate(snap.val() || 0.0001));
+
+    const bankUpgradeLevelRef = ref(database, 'bankUpgradeLevel');
+    onValue(bankUpgradeLevelRef, (snap) => setBankUpgradeLevel(snap.val() || 0));
+
+    const workUpgradeLevelRef = ref(database, 'workUpgradeLevel');
+    onValue(workUpgradeLevelRef, (snap) => setWorkUpgradeLevel(snap.val() || 0));
+
+    const presidentRef = ref(database, 'president');
+    onValue(presidentRef, (snap) => setPresident(snap.val() || ''));
+
+    const presidencyEndRef = ref(database, 'presidencyEnd');
+    onValue(presidencyEndRef, (snap) => setPresidencyEnd(snap.val() || 0));
+
+    const candidatesRef = ref(database, 'candidates');
+    onValue(candidatesRef, (snap) => setCandidates(snap.val() || []));
+
+    const votesRef = ref(database, 'votes');
+    onValue(votesRef, (snap) => setVotes(snap.val() || {}));
+
+    const votingEndRef = ref(database, 'votingEnd');
+    onValue(votingEndRef, (snap) => setVotingEnd(snap.val() || 0));
+
+    const messagesRef = ref(database, 'messages');
+    onValue(messagesRef, (snap) => {
+      const val = snap.val();
+      setMessages(val ? Object.values(val) : []);
+    });
+
+  }, [user]);
+
+  // Синхронизация personal states
+  useEffect(() => {
+    if (!user) return;
+
+    const balanceRef = ref(database, `users/${user.uid}/balance`);
+    onValue(balanceRef, (snap) => setBalance(snap.val() || 0));
+
+    const bankRef = ref(database, `users/${user.uid}/bank`);
+    onValue(bankRef, (snap) => setBank(snap.val() || 0));
+
+    const lastWithdrawRef = ref(database, `users/${user.uid}/lastWithdraw`);
+    onValue(lastWithdrawRef, (snap) => setLastWithdraw(snap.val() || 0));
+
+    const usernameRef = ref(database, `users/${user.uid}/username`);
+    onValue(usernameRef, (snap) => setUsername(snap.val() || ''));
+
+    const votedRef = ref(database, `users/${user.uid}/voted`);
+    onValue(votedRef, (snap) => setVoted(snap.val() || false));
+
+    const workLevelRef = ref(database, `users/${user.uid}/workLevel`);
+    onValue(workLevelRef, (snap) => setWorkLevel(snap.val() || 1));
+
+    const workCostRef = ref(database, `users/${user.uid}/workCost`);
+    onValue(workCostRef, (snap) => setWorkCost(snap.val() || 10));
+
+    const playerLossesRef = ref(database, `users/${user.uid}/playerLosses`);
+    onValue(playerLossesRef, (snap) => setPlayerLosses(snap.val() || 0));
+
+  }, [user]);
+
+  // Блокируем прокрутку страницы
+  useEffect(() => {
+    const original = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = original;
+    };
+  }, []);
+
+  // Центрирование карты при первом рендере
+  useEffect(() => {
+    if (containerRef.current) {
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      setOffset({
+        x: (vw - WIDTH * PIXEL_SIZE * zoom) / 2,
+        y: (vh - HEIGHT * PIXEL_SIZE * zoom) / 2
+      });
+    }
+  }, []);
+
+  // Тики секундных таймеров
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Автозавершение голосования и автоматическая отставка президента
+  useEffect(() => {
+    if (votingEnd > 0 && now >= votingEnd) {
+      finishElection();
+    }
+    if (president && presidencyEnd > 0 && now >= presidencyEnd) {
+      set(ref(database, 'president'), '');
+      set(ref(database, 'presidencyEnd'), 0);
+    }
+  }, [now, votingEnd, president, presidencyEnd]);
+
+  // Рисуем карту на canvas
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    const ctx = canvasRef.current.getContext('2d');
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+    ctx.setTransform(zoom, 0, 0, zoom, offset.x, offset.y);
+
+    for (let y = 0; y < HEIGHT; y++) {
+      for (let x = 0; x < WIDTH; x++) {
+        let color = colors[map[y][x].id];
+        if (isBorder(map, x, y, playerId)) {
+          color = cooldown ? colors.borderDisabled : colors.border;
+        }
+        if (map[y][x].fort > 0) {
+          color = darken(color);
+        }
+        ctx.fillStyle = color;
+        ctx.fillRect(x * PIXEL_SIZE, y * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
+      }
+    }
+  }, [map, zoom, offset, playerId, cooldown]);
+
+  // Проценты по депозиту каждые 5 сек
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (bank > 0) {
+        const newBank = +(bank * (1 + bankRate)).toFixed(4);
+        set(ref(database, `users/${user.uid}/bank`), newBank);
+      }
+    }, 5000);
+    return () => clearInterval(id);
+  }, [bankRate, bank, user]);
+
+  // Проверка конца игры
+  useEffect(() => {
+    const { p1, p2, total } = countCells(map);
+    if (p1 / total > 0.9) {
+      alert('Синяя команда победила! Игра начинается заново.');
+      resetGame();
+    } else if (p2 / total > 0.9) {
+      alert('Красная команда победила! Игра начинается заново.');
+      resetGame();
+    }
+  }, [map]);
+
+  function resetGame() {
+    set(ref(database, 'map'), generateMap());
+    set(ref(database, 'treasury'), 10000);
+    set(ref(database, 'globalWorkBonus'), 0);
+    set(ref(database, 'bankRate'), 0.0001);
+    set(ref(database, 'bankUpgradeLevel'), 0);
+    set(ref(database, 'workUpgradeLevel'), 0);
+    set(ref(database, 'president'), '');
+    set(ref(database, 'presidencyEnd'), 0);
+    set(ref(database, 'candidates'), []);
+    set(ref(database, 'votes'), {});
+    set(ref(database, 'votingEnd'), 0);
+    set(ref(database, 'messages'), null); // Clear messages
+
+    // Reset user data for all users? For simplicity, reset current user
+    set(ref(database, `users/${user.uid}/balance`), 0);
+    set(ref(database, `users/${user.uid}/bank`), 0);
+    set(ref(database, `users/${user.uid}/lastWithdraw`), 0);
+    set(ref(database, `users/${user.uid}/voted`), false);
+    set(ref(database, `users/${user.uid}/workLevel`), 1);
+    set(ref(database, `users/${user.uid}/workCost`), 10);
+    set(ref(database, `users/${user.uid}/playerLosses`), 0);
+    // Note: In a real app, you'd need to reset all users, perhaps with a server function.
+  }
+
+  function handleCanvasClick(e) {
+    const rect = canvasRef.current.getBoundingClientRect();
+    const cx = (e.clientX - rect.left - offset.x) / zoom;
+    const cy = (e.clientY - rect.top - offset.y) / zoom;
+    const x = Math.floor(cx / PIXEL_SIZE);
+    const y = Math.floor(cy / PIXEL_SIZE);
+
+    if (x < 0 || x >= WIDTH || y < 0 || y >= HEIGHT) return;
+
+    if (placingBunker) {
+      if (map[y][x].id === playerId) {
+        const newMap = map.map(row => row.map(cell => ({ ...cell })));
+        addBunker(newMap, x, y, playerId);
+        set(ref(database, 'map'), newMap);
+        setPlacingBunker(false);
+      } else {
+        alert('Можно строить только на своей территории');
+      }
+      return;
+    }
+
+    if (placingArtillery) {
+      const newMap = map.map(row => row.map(cell => ({ ...cell })));
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (
+            nx >= 0 &&
+            nx < WIDTH &&
+            ny >= 0 &&
+            ny < HEIGHT &&
+            Math.max(Math.abs(dx), Math.abs(dy)) <= 1 &&
+            newMap[ny][nx].id === 2
+          ) {
+            newMap[ny][nx].id = 0;
+            newMap[ny][nx].fort = 0;
+          }
+        }
+      }
+      set(ref(database, 'map'), newMap);
+      setPlacingArtillery(false);
+      return;
+    }
+
+    if (cooldown) return;
+
+    if (isBorder(map, x, y, playerId)) {
+      const newMap = map.map(row => row.map(cell => ({ ...cell })));
+      if (newMap[y][x].fort > 0) {
+        newMap[y][x].fort--;
+      } else {
+        newMap[y][x].id = playerId;
+        newMap[y][x].fort = 0;
+      }
+      const withEnclaves = captureEnclaves(newMap, playerId);
+      set(ref(database, 'map'), withEnclaves);
+      setCooldown(true);
+      setTimeout(() => setCooldown(false), 10000);
+    }
+  }
+
+  function handleWheel(e) {
+    e.preventDefault();
+    if (!canvasRef.current) return;
+    const rect = canvasRef.current.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+
+    const wx = (mouseX - offset.x) / zoom;
+    const wy = (mouseY - offset.y) / zoom;
+
+    let nextZoom = zoom * (e.deltaY < 0 ? 1.1 : 0.9);
+    nextZoom = Math.max(0.2, Math.min(3, nextZoom));
+
+    const newOffset = {
+      x: offset.x - wx * (nextZoom - zoom),
+      y: offset.y - wy * (nextZoom - zoom)
+    };
+
+    setZoom(nextZoom);
+    setOffset(newOffset);
+  }
+
+  function handleMouseDown(e) {
+    if (e.button === 2) {
+      dragging.current = true;
+      lastPos.current = { x: e.clientX, y: e.clientY };
+      window.addEventListener('mousemove', handleMouseMove);
+      window.addEventListener('mouseup', handleMouseUp);
+      e.preventDefault();
+    }
+  }
+
+  function handleMouseMove(e) {
+    if (dragging.current) {
+      setOffset(o => ({
+        x: o.x + (e.clientX - lastPos.current.x),
+        y: o.y + (e.clientY - lastPos.current.y)
+      }));
+      lastPos.current = { x: e.clientX, y: e.clientY };
+    }
+  }
+
+  function handleMouseUp(e) {
+    dragging.current = false;
+    window.removeEventListener('mousemove', handleMouseMove);
+    window.removeEventListener('mouseup', handleMouseUp);
+    if (e) e.preventDefault();
+  }
+
+  function handleContextMenu(e) {
+    e.preventDefault();
+  }
+
+  function handleWork() {
+    if (workCooldown) return;
+    setWorkCooldown(true);
+    setTimeout(() => setWorkCooldown(false), 3000);
+
+    const profit = workLevel + globalWorkBonus;
+    const toTreasury = Math.floor(profit * 0.10);
+    const net = profit - toTreasury;
+    const toBank = Math.floor(net * 0.10);
+
+    set(ref(database, 'treasury'), treasury + toTreasury);
+    set(ref(database, `users/${user.uid}/bank`), bank + toBank);
+    set(ref(database, `users/${user.uid}/balance`), balance + (net - toBank));
+  }
+
+  function handleUpgrade() {
+    if (balance >= workCost) {
+      set(ref(database, `users/${user.uid}/balance`), balance - workCost);
+      set(ref(database, `users/${user.uid}/workLevel`), workLevel + 5);
+      set(ref(database, `users/${user.uid}/workCost`), Math.ceil(workCost * 1.7));
+    }
+  }
+
+  function doDeposit() {
+    const amount = Number(depositInput);
+    if (!Number.isFinite(amount) || amount <= 0 || balance < amount) return;
+    set(ref(database, `users/${user.uid}/balance`), balance - amount);
+    set(ref(database, `users/${user.uid}/bank`), bank + amount);
+    setDepositInput('');
+  }
+
+  function doWithdraw() {
+    const amount = Number(withdrawInput);
+    if (!Number.isFinite(amount) || amount <= 0) return;
+    const nowMs = Date.now();
+    const cdMs = 30 * 60 * 1000;
+    const passed = nowMs - lastWithdraw;
+
+    if (passed < cdMs) {
+      const left = Math.ceil((cdMs - passed) / 1000);
+      alert(`Снимать можно раз в 30 минут. Осталось: ${left} сек.`);
+      return;
+    }
+    if (bank < amount) return;
+    set(ref(database, `users/${user.uid}/bank`), bank - amount);
+    set(ref(database, `users/${user.uid}/balance`), balance + amount);
+    set(ref(database, `users/${user.uid}/lastWithdraw`), nowMs);
+    setWithdrawInput('');
+  }
+
+  function doDonate() {
+    const amount = Number(donateInput);
+    if (!Number.isFinite(amount) || amount <= 0 || balance < amount) return;
+    set(ref(database, `users/${user.uid}/balance`), balance - amount);
+    set(ref(database, 'treasury'), treasury + amount);
+    setDonateInput('');
+  }
+
+  function handleUpgradeBank() {
+    if (bankRate >= BANK_MAX_RATE) return;
+    const cost = BANK_UPGRADE_BASE_COST * (bankUpgradeLevel + 1);
+    if (treasury < cost) return;
+    set(ref(database, 'treasury'), treasury - cost);
+    set(ref(database, 'bankUpgradeLevel'), bankUpgradeLevel + 1);
+    set(ref(database, 'bankRate'), bankRate + BANK_RATE_STEP);
+  }
+
+  function handleUpgradeWork() {
+    const cost = WORK_UPGRADE_BASE_COST * (workUpgradeLevel + 1);
+    if (treasury < cost) return;
+    const increment = 25 * (workUpgradeLevel + 1);
+    set(ref(database, 'treasury'), treasury - cost);
+    set(ref(database, 'workUpgradeLevel'), workUpgradeLevel + 1);
+    set(ref(database, 'globalWorkBonus'), globalWorkBonus + increment);
+  }
+
+  function handleBuildBunker() {
+    if (treasury < BUNKER_COST) return;
+    set(ref(database, 'treasury'), treasury - BUNKER_COST);
+    setPlacingBunker(true);
+  }
+
+  function handleArtillery() {
+    if (treasury < ARTILLERY_COST) return;
+    set(ref(database, 'treasury'), treasury - ARTILLERY_COST);
+    setPlacingArtillery(true);
+  }
+
+  function handleSetUsername(e) {
+    const name = e.target.value.trim();
+    setUsername(name);
+    set(ref(database, `users/${user.uid}/username`), name);
+  }
+
+  function handleNominate() {
+    if (!username) return;
+
+    setCandidates(prev => {
+      const updated = prev.includes(username) ? prev : [...prev, username];
+      set(ref(database, 'candidates'), updated);
+      return updated;
+    });
+
+    setVotes(prev => {
+      const updated = { ...prev, [username]: prev[username] ?? 0 };
+      set(ref(database, 'votes'), updated);
+      return updated;
+    });
+
+    if (!votingEnd || votingEnd < Date.now()) {
+      const end = Date.now() + 2 * 60 * 1000;
+      set(ref(database, 'votingEnd'), end);
+      setVoted(false);
+      set(ref(database, `users/${user.uid}/voted`), false);
+    }
+
+    setActiveTab('elections');
+  }
+
+  function handleVote(candidate) {
+    if (!candidate || voted || !votingActive()) return;
+
+    const newVotes = { ...votes, [candidate]: (votes[candidate] || 0) + 1 };
+    set(ref(database, 'votes'), newVotes);
+
+    setVoted(true);
+    set(ref(database, `users/${user.uid}/voted`), true);
+  }
+
+  function votingActive() {
+    return votingEnd > Date.now();
+  }
+
+  const votingSecondsLeft = votingActive() ? Math.max(0, Math.floor((votingEnd - now) / 1000)) : 0;
+
+  function finishElection() {
+    if (!votingEnd) return;
+
+    const entries = Object.entries(votes);
+    let winner = '';
+    let maxV = -1;
+    for (const [name, v] of entries) {
+      if (v > maxV) {
+        maxV = v;
+        winner = name;
+      }
+    }
+
+    if (winner) {
+      set(ref(database, 'president'), winner);
+      const end = Date.now() + 30 * 60 * 1000;
+      set(ref(database, 'presidencyEnd'), end);
+    }
+
+    set(ref(database, 'candidates'), []);
+    set(ref(database, 'votes'), {});
+    set(ref(database, 'votingEnd'), 0);
+    // Reset voted for current user
+    setVoted(false);
+    set(ref(database, `users/${user.uid}/voted`), false);
+  }
+
+  function handleResign() {
+    set(ref(database, 'president'), '');
+    set(ref(database, 'presidencyEnd'), 0);
+  }
+
+  function handleSendMessage() {
+    if (!messageInput.trim()) return;
+    const newMessage = {
+      user: username || 'Анон',
+      text: messageInput.trim(),
+      time: Date.now()
+    };
+    push(ref(database, 'messages'), newMessage);
+    setMessageInput('');
+  }
+
+  const { p1, p2, neutral, total } = countCells(map);
+  const capturedByYou = Math.max(0, p1 - initialPlayerCellsRef.current);
+  const p1Pct = ((p1 / total) * 100).toFixed(2);
+  const p2Pct = ((p2 / total) * 100).toFixed(2);
+  const neutralPct = ((neutral / total) * 100).toFixed(2);
+
+  const menuTabStyle = isActive => ({
+    padding: '6px 12px',
+    background: isActive ? '#222' : '#333',
+    color: isActive ? '#ffe259' : '#fff',
+    border: 'none',
+    borderBottom: isActive ? '2px solid #ffe259' : '2px solid transparent',
+    cursor: 'pointer',
+    fontWeight: isActive ? 700 : 400,
+    fontSize: 14,
+    outline: 'none'
+  });
+
+  const presidencyLeftSec = president && presidencyEnd > now ? Math.max(0, Math.floor((presidencyEnd - now) / 1000)) : 0;
+
+  function fmtTime(sec) {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${m}:${String(s).padStart(2, '0')}`;
+  }
+
+  function fmtDate(ms) {
+    const d = new Date(ms);
+    return `${d.toLocaleDateString()} ${d.toLocaleTimeString()}`;
+  }
+
+  const nextWithdrawInSec = Math.max(0, Math.ceil((30 * 60 * 1000 - (Date.now() - lastWithdraw)) / 1000));
+
   return (
-    <div className="App">
-      <header className="App-header">
-        <img src="Octocat.png" className="App-logo" alt="logo" />
-        <p>
-          GitHub Codespaces <span className="heart">♥️</span> React
-        </p>
-        <p className="small">
-          Edit <code>src/App.jsx</code> and save to reload.
-        </p>
-        <p>
-          <a
-            className="App-link"
-            href="https://reactjs.org"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Learn React
-          </a>
-        </p>
-      </header>
+    <div
+      className="App"
+      style={{
+        width: '100vw',
+        height: '100vh',
+        background: '#181818',
+        overflow: 'hidden',
+        margin: 0,
+        padding: 0,
+        position: 'fixed',
+        left: 0,
+        top: 0
+      }}
+      tabIndex={0}
+    >
+      {/* Верхняя панель */}
+      <div
+        style={{
+          width: '100vw',
+          height: 48,
+          background: '#222',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          borderBottom: '1px solid #333',
+          position: 'absolute',
+          left: 0,
+          top: 0,
+          zIndex: 10
+        }}
+      >
+        <h2 style={{ color: '#fff', margin: '0 16px', fontSize: 20 }}>Пиксельная карта</h2>
+        <button
+          style={{
+            background: menuOpen ? '#ffe259' : '#333',
+            color: menuOpen ? '#222' : '#fff',
+            border: 'none',
+            borderRadius: 4,
+            padding: '6px 16px',
+            fontSize: 15,
+            fontWeight: 600,
+            marginRight: 16,
+            cursor: 'pointer',
+            transition: 'background 0.2s'
+          }}
+          onClick={() => setMenuOpen(v => !v)}
+        >
+          Меню
+        </button>
+      </div>
+
+      {/* Меню вкладок (оверлей) */}
+      {menuOpen && (
+        <div
+          style={{
+            position: 'absolute',
+            left: 0,
+            top: 48,
+            width: '100vw',
+            background: '#181818ee',
+            zIndex: 20,
+            borderBottom: '1px solid #333',
+            boxShadow: '0 2px 8px #000a'
+          }}
+        >
+          <div style={{ display: 'flex', gap: 0 }}>
+            {TABS.map(tab => (
+              <button key={tab.key} style={menuTabStyle(activeTab === tab.key)} onClick={() => setActiveTab(tab.key)}>
+                {tab.label}
+              </button>
+            ))}
+
+            {president && username === president && (
+              <button style={menuTabStyle(activeTab === 'president')} onClick={() => setActiveTab('president')}>
+                Президент
+              </button>
+            )}
+
+            {activeTab === 'elections' && (
+              <button style={menuTabStyle(true)} onClick={() => setActiveTab('elections')}>
+                Выборы
+              </button>
+            )}
+          </div>
+
+          <div style={{ padding: 16, color: '#fff', fontSize: 16, minHeight: 60 }}>
+            {activeTab === 'work' && (
+              <div>
+                <div style={{ marginBottom: 12, fontSize: 18 }}>
+                  Баланс: <span style={{ color: '#ffe259', fontWeight: 700 }}>{balance.toFixed(2)}$</span>
+                </div>
+
+                <div style={{ marginBottom: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  <button
+                    onClick={handleWork}
+                    disabled={workCooldown}
+                    style={{
+                      background: workCooldown ? '#888' : '#2196f3',
+                      color: '#fff',
+                      border: 'none',
+                      borderRadius: 4,
+                      padding: '8px 20px',
+                      fontSize: 16,
+                      fontWeight: 600,
+                      cursor: workCooldown ? 'not-allowed' : 'pointer'
+                    }}
+                  >
+                    Работать! (+{workLevel + globalWorkBonus}$)
+                  </button>
+                  <button
+                    onClick={handleUpgrade}
+                    disabled={balance < workCost}
+                    style={{
+                      background: balance < workCost ? '#888' : '#ffe259',
+                      color: balance < workCost ? '#ccc' : '#222',
+                      border: 'none',
+                      borderRadius: 4,
+                      padding: '8px 20px',
+                      fontSize: 16,
+                      fontWeight: 600,
+                      cursor: balance < workCost ? 'not-allowed' : 'pointer'
+                    }}
+                  >
+                    Прокачать ({workCost}$)
+                  </button>
+                </div>
+
+                <div style={{ color: '#aaa', fontSize: 14, marginBottom: 16 }}>
+                  Уровень: <b>{workLevel}</b> · Бонус: <b>{globalWorkBonus}</b> · Казна: <b style={{ color: '#ffe259' }}>{treasury.toFixed(2)}$</b>
+                </div>
+
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 16 }}>
+                  <input
+                    value={donateInput}
+                    onChange={e => setDonateInput(e.target.value)}
+                    placeholder="Пожертвование"
+                    style={{ background: '#222', color: '#fff', border: '1px solid #444', borderRadius: 4, padding: '6px 10px' }}
+                    inputMode="decimal"
+                  />
+                  <button
+                    onClick={doDonate}
+                    style={{ background: '#ffe259', color: '#222', border: 'none', borderRadius: 4, padding: '6px 16px', fontWeight: 600, cursor: 'pointer' }}
+                  >
+                    Пожертвовать
+                  </button>
+                </div>
+
+                <div
+                  style={{
+                    borderTop: '1px solid #333',
+                    paddingTop: 12,
+                    display: 'grid',
+                    gap: 8,
+                    gridTemplateColumns: '1fr'
+                  }}
+                >
+                  <div style={{ fontSize: 18, marginBottom: 4 }}>
+                    <b>Банк</b>
+                  </div>
+                  <div>
+                    Депозит: <b style={{ color: '#ffe259' }}>{bank.toFixed(2)}$</b>
+                  </div>
+                  <div style={{ color: '#aaa' }}>
+                    Проценты: <b>{(bankRate * 100).toFixed(2)}%</b> /5 сек.
+                  </div>
+
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <input
+                      value={depositInput}
+                      onChange={e => setDepositInput(e.target.value)}
+                      placeholder="Внести"
+                      style={{ background: '#222', color: '#fff', border: '1px solid #444', borderRadius: 4, padding: '6px 10px' }}
+                      inputMode="decimal"
+                    />
+                    <button
+                      onClick={doDeposit}
+                      style={{ background: '#2196f3', color: '#fff', border: 'none', borderRadius: 4, padding: '6px 16px', fontWeight: 600, cursor: 'pointer' }}
+                    >
+                      Внести
+                    </button>
+                  </div>
+
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <input
+                      value={withdrawInput}
+                      onChange={e => setWithdrawInput(e.target.value)}
+                      placeholder="Снять"
+                      style={{ background: '#222', color: '#fff', border: '1px solid #444', borderRadius: 4, padding: '6px 10px' }}
+                      inputMode="decimal"
+                    />
+                    <button
+                      onClick={doWithdraw}
+                      style={{ background: '#f44336', color: '#fff', border: 'none', borderRadius: 4, padding: '6px 16px', fontWeight: 600, cursor: 'pointer' }}
+                    >
+                      Снять
+                    </button>
+                    <span style={{ color: '#aaa', fontSize: 14 }}>
+                      {nextWithdrawInSec > 0 ? `Через ${fmtTime(nextWithdrawInSec)}` : 'Можно сейчас'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'war' && (
+              <div>
+                <div style={{ marginBottom: 8, fontSize: 18 }}>
+                  <b>Статистика территорий</b>
+                </div>
+                <div style={{ lineHeight: 1.5, fontSize: 14 }}>
+                  <div>
+                    Ваши клетки: <b style={{ color: colors[1] }}>{p1}</b> ({p1Pct}%)
+                  </div>
+                  <div>
+                    Соперника: <b style={{ color: colors[2] }}>{p2}</b> ({p2Pct}%)
+                  </div>
+                  <div>
+                    Нейтральные: <b>{neutral}</b> ({neutralPct}%)
+                  </div>
+                  <div style={{ marginTop: 4 }}>
+                    Захвачено вами: <b style={{ color: '#ffe259' }}>{capturedByYou}</b>
+                  </div>
+                  <div>
+                    Потери: <b style={{ color: '#f44336' }}>{playerLosses}</b>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'politics' && (
+              <div>
+                <div style={{ marginBottom: 8 }}>
+                  <b>Казна:</b> <span style={{ color: '#ffe259', fontWeight: 700 }}>{treasury.toFixed(2)}$</span>
+                </div>
+                <div style={{ marginBottom: 8 }}>
+                  <b>Имя:</b>{' '}
+                  <input
+                    value={username}
+                    onChange={handleSetUsername}
+                    style={{
+                      background: '#222',
+                      color: '#fff',
+                      border: '1px solid #444',
+                      borderRadius: 4,
+                      padding: '4px 8px',
+                      fontSize: 14,
+                      marginLeft: 4
+                    }}
+                    maxLength={16}
+                  />
+                </div>
+                <div style={{ marginBottom: 8 }}>
+                  <b>Президент:</b>{' '}
+                  {president ? (
+                    <span style={{ color: '#ffe259' }}>
+                      {president} {presidencyLeftSec > 0 ? `(осталось ${fmtTime(presidencyLeftSec)})` : ''}
+                    </span>
+                  ) : (
+                    'нет'
+                  )}
+                </div>
+                <div style={{ marginBottom: 8 }}>
+                  <button
+                    style={{
+                      background: candidates.includes(username) || !username ? '#888' : '#ffe259',
+                      color: candidates.includes(username) || !username ? '#ccc' : '#222',
+                      border: 'none',
+                      borderRadius: 4,
+                      padding: '6px 12px',
+                      fontSize: 14,
+                      fontWeight: 600,
+                      cursor: candidates.includes(username) || !username ? 'not-allowed' : 'pointer',
+                      marginRight: 8
+                    }}
+                    disabled={candidates.includes(username) || !username}
+                    onClick={handleNominate}
+                  >
+                    Кандидатура
+                  </button>
+                  <button
+                    style={{
+                      background: '#2196f3',
+                      color: '#fff',
+                      border: 'none',
+                      borderRadius: 4,
+                      padding: '6px 12px',
+                      fontSize: 14,
+                      fontWeight: 600,
+                      cursor: 'pointer'
+                    }}
+                    onClick={() => setActiveTab('elections')}
+                  >
+                    Выборы
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'elections' && (
+              <div>
+                <div style={{ marginBottom: 8 }}>
+                  {votingActive() ? (
+                    <span>
+                      Голосование идёт! До конца: <b>{fmtTime(votingSecondsLeft)}</b>
+                    </span>
+                  ) : (
+                    <span>Голосование не активно</span>
+                  )}
+                </div>
+
+                <div style={{ marginBottom: 8 }}>
+                  <b>Кандидаты:</b>
+                  <ul style={{ paddingLeft: 16, margin: 0, listStyleType: 'disc' }}>
+                    {candidates.length === 0 && <li>Нет кандидатов</li>}
+                    {candidates.map(name => (
+                      <li key={name} style={{ margin: '2px 0', fontSize: 14 }}>
+                        {name}{' '}
+                        <span style={{ color: '#ffe259' }}>{votes[name] || 0} голосов</span>{' '}
+                        {votingActive() && !voted && (
+                          <button
+                            style={{
+                              background: '#2196f3',
+                              color: '#fff',
+                              border: 'none',
+                              borderRadius: 4,
+                              padding: '2px 8px',
+                              marginLeft: 4,
+                              cursor: 'pointer',
+                              fontSize: 12
+                            }}
+                            onClick={() => handleVote(name)}
+                          >
+                            Голосовать
+                          </button>
+                        )}
+                        {voted && <span style={{ color: '#aaa', marginLeft: 4, fontSize: 12 }}>(Проголосовали)</span>}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+
+                {!votingActive() && (
+                  <button
+                    style={{
+                      background: '#333',
+                      color: '#fff',
+                      border: 'none',
+                      borderRadius: 4,
+                      padding: '6px 12px',
+                      fontSize: 14,
+                      fontWeight: 600,
+                      cursor: 'pointer'
+                    }}
+                    onClick={() => setActiveTab('politics')}
+                  >
+                    Назад
+                  </button>
+                )}
+              </div>
+            )}
+
+            {activeTab === 'chat' && (
+              <div>
+                <div style={{ marginBottom: 8, fontSize: 18 }}>
+                  <b>Командный чат</b>
+                </div>
+                <div style={{ maxHeight: 200, overflowY: 'auto', marginBottom: 8, padding: 6, background: '#222', borderRadius: 4 }}>
+                  {messages.map((msg, idx) => (
+                    <div key={idx} style={{ marginBottom: 4, borderBottom: '1px solid #333', paddingBottom: 4, fontSize: 14 }}>
+                      <span style={{ color: '#ffe259', fontWeight: 600 }}>{msg.user}</span> <span style={{ color: '#aaa', fontSize: 12 }}>({fmtDate(msg.time)})</span>
+                      <div>{msg.text}</div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input
+                    value={messageInput}
+                    onChange={e => setMessageInput(e.target.value)}
+                    placeholder="Сообщение"
+                    style={{ flex: 1, background: '#222', color: '#fff', border: '1px solid #444', borderRadius: 4, padding: '6px 10px', fontSize: 14 }}
+                  />
+                  <button
+                    onClick={handleSendMessage}
+                    style={{ background: '#2196f3', color: '#fff', border: 'none', borderRadius: 4, padding: '6px 12px', fontWeight: 600, cursor: 'pointer', fontSize: 14 }}
+                  >
+                    Отправить
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'president' && president && username === president && (
+              <div>
+                <div style={{ marginBottom: 8 }}>
+                  <b>Вы — президент!</b> Срок: {presidencyLeftSec > 0 ? fmtTime(presidencyLeftSec) : 'истёк'}
+                </div>
+                <div style={{ marginBottom: 8 }}>
+                  <b>Казна:</b> <span style={{ color: '#ffe259', fontWeight: 700 }}>{treasury.toFixed(2)}$</span>
+                </div>
+                <div style={{ marginBottom: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <div style={{ fontSize: 14 }}>
+                    <b>Банк:</b> Ур. {bankUpgradeLevel}, ставка {(bankRate * 100).toFixed(2)}%
+                    <button
+                      onClick={handleUpgradeBank}
+                      disabled={bankRate >= BANK_MAX_RATE || treasury < BANK_UPGRADE_BASE_COST * (bankUpgradeLevel + 1)}
+                      style={{
+                        background:
+                          bankRate >= BANK_MAX_RATE || treasury < BANK_UPGRADE_BASE_COST * (bankUpgradeLevel + 1)
+                            ? '#888'
+                            : '#2196f3',
+                        color: '#fff',
+                        border: 'none',
+                        borderRadius: 4,
+                        padding: '4px 12px',
+                        marginLeft: 8,
+                        fontWeight: 600,
+                        cursor:
+                          bankRate >= BANK_MAX_RATE || treasury < BANK_UPGRADE_BASE_COST * (bankUpgradeLevel + 1)
+                            ? 'not-allowed'
+                            : 'pointer',
+                        fontSize: 12
+                      }}
+                    >
+                      Улучшить ({BANK_UPGRADE_BASE_COST * (bankUpgradeLevel + 1)}$)
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 14 }}>
+                    <b>Работа:</b> Ур. {workUpgradeLevel}, бонус {globalWorkBonus}$
+                    <button
+                      onClick={handleUpgradeWork}
+                      disabled={treasury < WORK_UPGRADE_BASE_COST * (workUpgradeLevel + 1)}
+                      style={{
+                        background: treasury < WORK_UPGRADE_BASE_COST * (workUpgradeLevel + 1) ? '#888' : '#2196f3',
+                        color: '#fff',
+                        border: 'none',
+                        borderRadius: 4,
+                        padding: '4px 12px',
+                        marginLeft: 8,
+                        fontWeight: 600,
+                        cursor: treasury < WORK_UPGRADE_BASE_COST * (workUpgradeLevel + 1) ? 'not-allowed' : 'pointer',
+                        fontSize: 12
+                      }}
+                    >
+                      Улучшить ({WORK_UPGRADE_BASE_COST * (workUpgradeLevel + 1)}$)
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 14 }}>
+                    <b>Бункер:</b> Укрепляет 3x3
+                    <button
+                      onClick={handleBuildBunker}
+                      disabled={treasury < BUNKER_COST}
+                      style={{
+                        background: treasury < BUNKER_COST ? '#888' : '#2196f3',
+                        color: '#fff',
+                        border: 'none',
+                        borderRadius: 4,
+                        padding: '4px 12px',
+                        marginLeft: 8,
+                        fontWeight: 600,
+                        cursor: treasury < BUNKER_COST ? 'not-allowed' : 'pointer',
+                        fontSize: 12
+                      }}
+                    >
+                      Построить ({BUNKER_COST}$)
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 14 }}>
+                    <b>Артиллерия:</b> Нейтрализует 3x3 врага
+                    <button
+                      onClick={handleArtillery}
+                      disabled={treasury < ARTILLERY_COST}
+                      style={{
+                        background: treasury < ARTILLERY_COST ? '#888' : '#f44336',
+                        color: '#fff',
+                        border: 'none',
+                        borderRadius: 4,
+                        padding: '4px 12px',
+                        marginLeft: 8,
+                        fontWeight: 600,
+                        cursor: treasury < ARTILLERY_COST ? 'not-allowed' : 'pointer',
+                        fontSize: 12
+                      }}
+                    >
+                      Запустить ({ARTILLERY_COST}$)
+                    </button>
+                  </div>
+                </div>
+                <div style={{ marginBottom: 8 }}>
+                  <button
+                    style={{
+                      background: '#f44336',
+                      color: '#fff',
+                      border: 'none',
+                      borderRadius: 4,
+                      padding: '8px 20px',
+                      fontSize: 16,
+                      fontWeight: 600,
+                      cursor: 'pointer'
+                    }}
+                    onClick={handleResign}
+                  >
+                    Отставка
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Карта на весь экран (под меню) */}
+      <div
+        ref={containerRef}
+        style={{
+          width: '100vw',
+          height: '100vh',
+          overflow: 'hidden',
+          position: 'absolute',
+          left: 0,
+          top: 0,
+          userSelect: 'none',
+          cursor: dragging.current ? 'grabbing' : 'default',
+          zIndex: 1
+        }}
+        onWheel={handleWheel}
+        onMouseDown={handleMouseDown}
+        onContextMenu={handleContextMenu}
+      >
+        <canvas
+          ref={canvasRef}
+          width={WIDTH * PIXEL_SIZE}
+          height={HEIGHT * PIXEL_SIZE}
+          style={{
+            display: 'block',
+            position: 'absolute',
+            left: 0,
+            top: 0,
+            width: WIDTH * PIXEL_SIZE,
+            height: HEIGHT * PIXEL_SIZE,
+            cursor: dragging.current ? 'grabbing' : 'default'
+          }}
+          onClick={handleCanvasClick}
+          onMouseDown={handleMouseDown}
+          onContextMenu={handleContextMenu}
+        />
+      </div>
+
+      {/* Инструкция поверх карты, снизу */}
+      <div
+        style={{
+          position: 'absolute',
+          left: 0,
+          bottom: 0,
+          width: '100vw',
+          background: 'rgba(24,24,24,0.95)',
+          color: '#aaa',
+          fontSize: 14,
+          padding: '8px 0',
+          textAlign: 'center',
+          zIndex: 5,
+          borderTop: '1px solid #333'
+        }}
+      >
+        Колёсико — зум, ПКМ — перемещение.<br />
+        Клик по <span style={{ color: cooldown ? colors.borderDisabled : colors.border, fontWeight: 700 }}>жёлтым</span> для захвата.<br />
+        Окружённые — авто.<br />
+        Темнее — несколько кликов.<br />
+        <span style={{ color: '#ffe259' }}>КД: 10 сек</span>
+      </div>
     </div>
   );
 }

@@ -1,0 +1,14 @@
+body {
+  margin: 0;
+  font-family: Arial, sans-serif;
+  background-color: #181818;
+  color: #fff;
+}
+
+.App-header {
+  text-align: center;
+}
+
+canvas {
+  border: 1px solid #333;
+}
