@@ -26,29 +26,29 @@ const auth = getAuth(app);
 /**
  * --- Константы карты ---
  */
-const WIDTH = 320;
-const HEIGHT = 192;
+const WIDTH = 213;
+const HEIGHT = 128;
 const PIXEL_SIZE = 6;
 
 /**
- * Карта: слева 20 колонок — игрок (1), справа 20 — соперник (2), середина — нейтраль (0)
+ * Карта: слева 14 колонок — игрок (1), справа 14 — соперник (2), середина — нейтраль (0)
  */
 function generateMap() {
   const map = Array.from({ length: HEIGHT }, () =>
-    Array.from({ length: WIDTH }, (_, x) => ({ id: x < 20 ? 1 : x > WIDTH - 21 ? 2 : 0, fort: 0, resource: false, building: 'none' }))
+    Array.from({ length: WIDTH }, (_, x) => ({ id: x < 14 ? 1 : x > WIDTH - 15 ? 2 : 0, fort: 0, resource: false, building: 'none' }))
   );
 
   // Изначальные бункеры для красной команды (игрок 2)
-  addBunker(map, WIDTH - 30, 30, 2);
-  addBunker(map, WIDTH - 30, Math.floor(HEIGHT / 2), 2);
-  addBunker(map, WIDTH - 30, HEIGHT - 30, 2);
+  addBunker(map, WIDTH - 20, 20, 2);
+  addBunker(map, WIDTH - 20, Math.floor(HEIGHT / 2), 2);
+  addBunker(map, WIDTH - 20, HEIGHT - 20, 2);
 
   // Добавляем ресурсные клетки в нейтральной зоне
   const resourceCount = 20;
   for (let i = 0; i < resourceCount; i++) {
     let placed = false;
     while (!placed) {
-      const x = Math.floor(Math.random() * (WIDTH - 41)) + 20; // 20 to WIDTH-21
+      const x = Math.floor(Math.random() * (WIDTH - 29)) + 14; // 14 to WIDTH-15
       const y = Math.floor(Math.random() * HEIGHT);
       if (!map[y][x].resource) {
         map[y][x].resource = true;
@@ -246,7 +246,7 @@ const TABS = [
  */
 const BUNKER_COST = 5000;
 const WALL_COST = 3500;
-const FACTORY_COST = 1500;
+const FACTORY_COST = 2500;
 const BANK_UPGRADE_BASE_COST = 1000;
 const WORK_UPGRADE_BASE_COST = 2000;
 const BANK_RATE_STEP = 0.0001; // +0.01%
@@ -257,6 +257,13 @@ const AI_WORK_MAINTENANCE = 200; // per minute
 const CAPTURE_NEUTRAL_COST = 50;
 const CAPTURE_ENEMY_COST = 100;
 const FACTORY_INCOME = 20; // per minute per factory
+const RESOURCE_INCOME = 500; // per minute per resource
+
+// Новые константы для улучшений в войне
+const CAPTURE_SIZE_UPGRADE_COST = 5000; // Стоимость улучшения размера захвата
+const CD_REDUCTION_UPGRADE_COST = 3000; // Стоимость уменьшения КД
+const MAX_CAPTURE_SIZE_LEVEL = 3; // Макс уровень: 1->2->3->4 пикселя
+const MAX_CD_REDUCTION_LEVEL = 5; // Макс уровень: уменьшает КД на 1 сек за уровень, мин 5 сек
 
 function App() {
   const playerId = 1;
@@ -310,7 +317,7 @@ function App() {
   const [now, setNow] = useState(Date.now());
   const [votingEnd, setVotingEnd] = useState(0);
 
-  const initialPlayerCellsRef = useRef(20 * HEIGHT);
+  const initialPlayerCellsRef = useRef(14 * HEIGHT);
 
   const [playerLosses, setPlayerLosses] = useState(0);
 
@@ -325,6 +332,9 @@ function App() {
   const [hoverY, setHoverY] = useState(-1);
 
   const [animations, setAnimations] = useState([]);
+
+  const [captureSizeLevel, setCaptureSizeLevel] = useState(0); // 0: 1 пиксель, 1: 2, 2: 3, 3: 4
+  const [cdReductionLevel, setCdReductionLevel] = useState(0); // Уменьшает КД на 1 сек за уровень
 
   // Аутентификация
   useEffect(() => {
@@ -434,6 +444,12 @@ function App() {
 
     const aiWorkEnabledRef = ref(database, `users/${user.uid}/aiWorkEnabled`);
     onValue(aiWorkEnabledRef, (snap) => setAiWorkEnabled(snap.val() || false));
+
+    const captureSizeLevelRef = ref(database, `users/${user.uid}/captureSizeLevel`);
+    onValue(captureSizeLevelRef, (snap) => setCaptureSizeLevel(snap.val() || 0));
+
+    const cdReductionLevelRef = ref(database, `users/${user.uid}/cdReductionLevel`);
+    onValue(cdReductionLevelRef, (snap) => setCdReductionLevel(snap.val() || 0));
 
   }, [user]);
 
@@ -594,8 +610,9 @@ function App() {
   useEffect(() => {
     const id = setInterval(() => {
       if (bank > 0) {
-        const newBank = +(bank * (1 + bankRate)).toFixed(4);
-        set(ref(database, `users/${user.uid}/bank`), newBank);
+        runTransaction(ref(database, `users/${user.uid}/bank`), (currentBank) => {
+          return +(currentBank * (1 + bankRate)).toFixed(4);
+        });
       }
     }, 5000);
     return () => clearInterval(id);
@@ -618,7 +635,7 @@ function App() {
       runTransaction(ref(database, 'lastIncomeTimeBlue'), (current) => {
         const periods = Math.floor((now - current) / 60000);
         if (periods > 0) {
-          const resourceIncome = periods * countResources(map, 1) * 500;
+          const resourceIncome = periods * countResources(map, 1) * RESOURCE_INCOME;
           const factoryIncome = periods * countFactories(map, 1) * FACTORY_INCOME;
           runTransaction(ref(database, 'blueTreasury'), (treas) => treas + resourceIncome + factoryIncome);
           return current + periods * 60000;
@@ -630,7 +647,7 @@ function App() {
       runTransaction(ref(database, 'lastIncomeTimeRed'), (current) => {
         const periods = Math.floor((now - current) / 60000);
         if (periods > 0) {
-          const resourceIncome = periods * countResources(map, 2) * 500;
+          const resourceIncome = periods * countResources(map, 2) * RESOURCE_INCOME;
           const factoryIncome = periods * countFactories(map, 2) * FACTORY_INCOME;
           runTransaction(ref(database, 'redTreasury'), (treas) => treas + resourceIncome + factoryIncome);
           return current + periods * 60000;
@@ -643,13 +660,27 @@ function App() {
 
   // Логика бота для красной команды
   useEffect(() => {
-    const botInterval = setInterval(tryBotAction, 5000); // try every 5s
+    const botInterval = setInterval(tryBotAction, 2000); // Увеличена активность
     return () => clearInterval(botInterval);
   }, [map, redTreasury, botCooldownEnd, now]);
 
   function tryBotAction() {
     if (now < botCooldownEnd) return;
 
+    // Шанс на разные действия
+    const action = Math.random();
+    if (action < 0.6) { // 60% захват
+      botCapture();
+    } else if (action < 0.8) { // 20% бункер
+      placeBotBunker();
+    } else if (action < 0.9) { // 10% стена
+      placeBotWall();
+    } else { // 10% фабрика
+      placeBotFactory();
+    }
+  }
+
+  function botCapture() {
     // Найти пограничные клетки для 2
     const borders = [];
     for (let y = 0; y < HEIGHT; y++) {
@@ -668,29 +699,25 @@ function App() {
     const targetId = map[y][x].id;
     const cost = targetId === 0 ? CAPTURE_NEUTRAL_COST : CAPTURE_ENEMY_COST;
 
-    if (redTreasury < cost) {
-      // Попробовать разместить бункер вместо
-      if (redTreasury >= BUNKER_COST) {
-        placeBotBunker();
-      }
-      return;
-    }
+    if (redTreasury < cost) return;
 
     // Транзакция для кулдауна
     runTransaction(ref(database, 'botCooldownEnd'), (current) => {
       if (now >= current) {
         // Захват
-        const newMap = map.map(row => row.map(cell => ({ ...cell })));
-        runTransaction(ref(database, 'redTreasury'), (treas) => treas - cost);
-        if (newMap[y][x].fort > 0) {
-          newMap[y][x].fort--;
-        } else {
-          newMap[y][x].id = 2;
-          newMap[y][x].fort = 0;
-        }
-        const withEnclaves = captureEnclaves(newMap, 2);
-        set(ref(database, 'map'), withEnclaves);
-        return now + 5000;
+        runTransaction(ref(database, 'map'), (currentMap) => {
+          const newMap = currentMap.map(row => row.map(cell => ({ ...cell })));
+          runTransaction(ref(database, 'redTreasury'), (treas) => treas - cost);
+          if (newMap[y][x].fort > 0) {
+            newMap[y][x].fort--;
+          } else {
+            newMap[y][x].id = 2;
+            newMap[y][x].fort = 0;
+          }
+          const withEnclaves = captureEnclaves(newMap, 2);
+          return withEnclaves;
+        });
+        return now + 2000;
       }
       return current;
     });
@@ -700,7 +727,7 @@ function App() {
     // Найти случайную позицию на своей территории
     const positions = [];
     for (let y = 0; y < HEIGHT; y++) {
-      for (let x = WIDTH - 40; x < WIDTH; x++) { // near right
+      for (let x = WIDTH - 28; x < WIDTH; x++) { // near right
         if (map[y][x].id === 2) {
           positions.push({x, y});
         }
@@ -712,10 +739,64 @@ function App() {
 
     runTransaction(ref(database, 'redTreasury'), (treas) => {
       if (treas >= BUNKER_COST) {
-        const newMap = map.map(row => row.map(cell => ({ ...cell })));
-        addBunker(newMap, x, y, 2);
-        set(ref(database, 'map'), newMap);
+        runTransaction(ref(database, 'map'), (currentMap) => {
+          const newMap = currentMap.map(row => row.map(cell => ({ ...cell })));
+          addBunker(newMap, x, y, 2);
+          return newMap;
+        });
         return treas - BUNKER_COST;
+      }
+      return treas;
+    });
+  }
+
+  function placeBotWall() {
+    const positions = [];
+    for (let y = 0; y < HEIGHT; y++) {
+      for (let x = WIDTH - 28; x < WIDTH; x++) {
+        if (map[y][x].id === 2 && map[y][x].building === 'none') {
+          positions.push({x, y});
+        }
+      }
+    }
+    if (positions.length === 0) return;
+
+    const {x, y} = positions[Math.floor(Math.random() * positions.length)];
+
+    runTransaction(ref(database, 'redTreasury'), (treas) => {
+      if (treas >= WALL_COST) {
+        runTransaction(ref(database, 'map'), (currentMap) => {
+          const newMap = currentMap.map(row => row.map(cell => ({ ...cell })));
+          addWall(newMap, x, y, 2);
+          return newMap;
+        });
+        return treas - WALL_COST;
+      }
+      return treas;
+    });
+  }
+
+  function placeBotFactory() {
+    const positions = [];
+    for (let y = 0; y < HEIGHT; y++) {
+      for (let x = WIDTH - 28; x < WIDTH; x++) {
+        if (map[y][x].id === 2 && map[y][x].building === 'none') {
+          positions.push({x, y});
+        }
+      }
+    }
+    if (positions.length === 0) return;
+
+    const {x, y} = positions[Math.floor(Math.random() * positions.length)];
+
+    runTransaction(ref(database, 'redTreasury'), (treas) => {
+      if (treas >= FACTORY_COST) {
+        runTransaction(ref(database, 'map'), (currentMap) => {
+          const newMap = currentMap.map(row => row.map(cell => ({ ...cell })));
+          addFactory(newMap, x, y, 2);
+          return newMap;
+        });
+        return treas - FACTORY_COST;
       }
       return treas;
     });
@@ -733,15 +814,18 @@ function App() {
   useEffect(() => {
     if (aiWorkEnabled) {
       const deductId = setInterval(() => {
-        if (balance >= AI_WORK_MAINTENANCE) {
-          set(ref(database, `users/${user.uid}/balance`), balance - AI_WORK_MAINTENANCE);
-        } else {
-          set(ref(database, `users/${user.uid}/aiWorkEnabled`), false);
-        }
+        runTransaction(ref(database, `users/${user.uid}/balance`), (currentBalance) => {
+          if (currentBalance >= AI_WORK_MAINTENANCE) {
+            return currentBalance - AI_WORK_MAINTENANCE;
+          } else {
+            runTransaction(ref(database, `users/${user.uid}/aiWorkEnabled`), () => false);
+            return currentBalance;
+          }
+        });
       }, 60000);
       return () => clearInterval(deductId);
     }
-  }, [aiWorkEnabled, balance, user]);
+  }, [aiWorkEnabled, user]);
 
   function handleCanvasClick(e) {
     const rect = canvasRef.current.getBoundingClientRect();
@@ -766,16 +850,16 @@ function App() {
         if (!valid) break;
       }
       if (valid) {
-        if (blueTreasury < BUNKER_COST) {
-          alert('Недостаточно средств в казне');
-          setPlacingBunker(false);
-          return;
-        }
-        const newMap = map.map(row => row.map(cell => ({ ...cell })));
-        addBunker(newMap, x, y, playerId);
-        setAnimations(prev => [...prev, {x, y, type: 'bunker', time: Date.now()}]);
-        set(ref(database, 'blueTreasury'), blueTreasury - BUNKER_COST);
-        set(ref(database, 'map'), newMap);
+        runTransaction(ref(database, 'blueTreasury'), (treas) => {
+          if (treas < BUNKER_COST) return treas;
+          runTransaction(ref(database, 'map'), (currentMap) => {
+            const newMap = currentMap.map(row => row.map(cell => ({ ...cell })));
+            addBunker(newMap, x, y, playerId);
+            setAnimations(prev => [...prev, {x, y, type: 'bunker', time: Date.now()}]);
+            return newMap;
+          });
+          return treas - BUNKER_COST;
+        });
         setPlacingBunker(false);
       } else {
         alert('Можно строить только на своей территории');
@@ -785,16 +869,16 @@ function App() {
 
     if (placingWall) {
       if (map[y][x].id === playerId && map[y][x].building === 'none') {
-        if (blueTreasury < WALL_COST) {
-          alert('Недостаточно средств в казне');
-          setPlacingWall(false);
-          return;
-        }
-        const newMap = map.map(row => row.map(cell => ({ ...cell })));
-        addWall(newMap, x, y, playerId);
-        setAnimations(prev => [...prev, {x, y, type: 'capture', time: Date.now()}]);
-        set(ref(database, 'blueTreasury'), blueTreasury - WALL_COST);
-        set(ref(database, 'map'), newMap);
+        runTransaction(ref(database, 'blueTreasury'), (treas) => {
+          if (treas < WALL_COST) return treas;
+          runTransaction(ref(database, 'map'), (currentMap) => {
+            const newMap = currentMap.map(row => row.map(cell => ({ ...cell })));
+            addWall(newMap, x, y, playerId);
+            setAnimations(prev => [...prev, {x, y, type: 'capture', time: Date.now()}]);
+            return newMap;
+          });
+          return treas - WALL_COST;
+        });
         setPlacingWall(false);
       } else {
         alert('Можно строить только на своей территории без построек');
@@ -804,16 +888,16 @@ function App() {
 
     if (placingFactory) {
       if (map[y][x].id === playerId && map[y][x].building === 'none') {
-        if (blueTreasury < FACTORY_COST) {
-          alert('Недостаточно средств в казне');
-          setPlacingFactory(false);
-          return;
-        }
-        const newMap = map.map(row => row.map(cell => ({ ...cell })));
-        addFactory(newMap, x, y, playerId);
-        setAnimations(prev => [...prev, {x, y, type: 'capture', time: Date.now()}]);
-        set(ref(database, 'blueTreasury'), blueTreasury - FACTORY_COST);
-        set(ref(database, 'map'), newMap);
+        runTransaction(ref(database, 'blueTreasury'), (treas) => {
+          if (treas < FACTORY_COST) return treas;
+          runTransaction(ref(database, 'map'), (currentMap) => {
+            const newMap = currentMap.map(row => row.map(cell => ({ ...cell })));
+            addFactory(newMap, x, y, playerId);
+            setAnimations(prev => [...prev, {x, y, type: 'capture', time: Date.now()}]);
+            return newMap;
+          });
+          return treas - FACTORY_COST;
+        });
         setPlacingFactory(false);
       } else {
         alert('Можно строить только на своей территории без построек');
@@ -822,68 +906,93 @@ function App() {
     }
 
     if (placingArtillery) {
-      const newMap = map.map(row => row.map(cell => ({ ...cell })));
-      let affected = false;
-      for (let dy = -1; dy <= 1; dy++) {
-        for (let dx = -1; dx <= 1; dx++) {
-          const nx = x + dx;
-          const ny = y + dy;
-          if (
-            nx >= 0 &&
-            nx < WIDTH &&
-            ny >= 0 &&
-            ny < HEIGHT &&
-            Math.max(Math.abs(dx), Math.abs(dy)) <= 1 &&
-            newMap[ny][nx].id === 2
-          ) {
-            newMap[ny][nx].id = 0;
-            newMap[ny][nx].fort = 0;
-            newMap[ny][nx].building = 'none'; // Стена или фабрика уничтожается
-            affected = true;
+      runTransaction(ref(database, 'map'), (currentMap) => {
+        const newMap = currentMap.map(row => row.map(cell => ({ ...cell })));
+        let affected = false;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const nx = x + dx;
+            const ny = y + dy;
+            if (
+              nx >= 0 &&
+              nx < WIDTH &&
+              ny >= 0 &&
+              ny < HEIGHT &&
+              Math.max(Math.abs(dx), Math.abs(dy)) <= 1 &&
+              newMap[ny][nx].id === 2
+            ) {
+              newMap[ny][nx].id = 0;
+              newMap[ny][nx].fort = 0;
+              newMap[ny][nx].building = 'none'; // Стена или фабрика уничтожается
+              affected = true;
+            }
           }
         }
-      }
-      if (affected) {
-        if (blueTreasury < ARTILLERY_COST) {
-          alert('Недостаточно средств в казне');
+        if (affected) {
+          runTransaction(ref(database, 'blueTreasury'), (treas) => {
+            if (treas < ARTILLERY_COST) return treas;
+            setAnimations(prev => [...prev, {x, y, type: 'artillery', time: Date.now()}]);
+            return treas - ARTILLERY_COST;
+          });
           setPlacingArtillery(false);
-          return;
+          return newMap;
+        } else {
+          alert('Нет вражеских клеток в зоне');
+          return currentMap;
         }
-        setAnimations(prev => [...prev, {x, y, type: 'artillery', time: Date.now()}]);
-        set(ref(database, 'blueTreasury'), blueTreasury - ARTILLERY_COST);
-        set(ref(database, 'map'), newMap);
-        setPlacingArtillery(false);
-      } else {
-        alert('Нет вражеских клеток в зоне');
-      }
+      });
       return;
     }
 
     if (cooldown) return;
 
     if (isBorder(map, x, y, playerId)) {
-      const targetId = map[y][x].id;
-      const cost = targetId === 0 ? CAPTURE_NEUTRAL_COST : CAPTURE_ENEMY_COST;
-      if (blueTreasury < cost) {
-        alert('Недостаточно средств в казне');
-        return;
+      const captureSize = captureSizeLevel + 1; // 1 to 4
+      const captured = [];
+      for (let i = 0; i < captureSize; i++) {
+        // Находим последовательные border клетки, начиная от кликнутой
+        // Для простоты: захватываем в линию по горизонтали от x
+        const tx = x + i;
+        if (tx >= WIDTH || !isBorder(map, tx, y, playerId)) break;
+        captured.push({tx, y});
       }
-      set(ref(database, 'blueTreasury'), blueTreasury - cost);
-      const newMap = map.map(row => row.map(cell => ({ ...cell })));
-      if (newMap[y][x].fort > 0) {
-        newMap[y][x].fort--;
-        if (newMap[y][x].fort === 0 && newMap[y][x].building === 'wall') {
-          newMap[y][x].building = 'none';
+
+      if (captured.length === 0) return;
+
+      let totalCost = 0;
+      captured.forEach(({tx, ty}) => {
+        const targetId = map[ty][tx].id;
+        totalCost += targetId === 0 ? CAPTURE_NEUTRAL_COST : CAPTURE_ENEMY_COST;
+      });
+
+      runTransaction(ref(database, 'blueTreasury'), (treas) => {
+        if (treas < totalCost) {
+          alert('Недостаточно средств в казне');
+          return treas;
         }
-      } else {
-        newMap[y][x].id = playerId;
-        newMap[y][x].fort = 0;
-      }
-      const withEnclaves = captureEnclaves(newMap, playerId);
-      setAnimations(prev => [...prev, {x, y, type: 'capture', time: Date.now()}]);
-      set(ref(database, 'map'), withEnclaves);
+        runTransaction(ref(database, 'map'), (currentMap) => {
+          const newMap = currentMap.map(row => row.map(cell => ({ ...cell })));
+          captured.forEach(({tx, ty}) => {
+            if (newMap[ty][tx].fort > 0) {
+              newMap[ty][tx].fort--;
+              if (newMap[ty][tx].fort === 0 && newMap[ty][tx].building === 'wall') {
+                newMap[ty][tx].building = 'none';
+              }
+            } else {
+              newMap[ty][tx].id = playerId;
+              newMap[ty][tx].fort = 0;
+            }
+            setAnimations(prev => [...prev, {x: tx, y: ty, type: 'capture', time: Date.now()}]);
+          });
+          const withEnclaves = captureEnclaves(newMap, playerId);
+          return withEnclaves;
+        });
+        return treas - totalCost;
+      });
+
       setCooldown(true);
-      setTimeout(() => setCooldown(false), 10000);
+      const cdTime = Math.max(5000, 10000 - cdReductionLevel * 1000);
+      setTimeout(() => setCooldown(false), cdTime);
     }
   }
 
@@ -961,31 +1070,59 @@ function App() {
     const net = profit - toTreasury;
     const toBank = Math.floor(net * 0.10);
 
-    set(ref(database, 'blueTreasury'), blueTreasury + toTreasury);
-    set(ref(database, `users/${user.uid}/bank`), bank + toBank);
-    set(ref(database, `users/${user.uid}/balance`), balance + (net - toBank));
+    runTransaction(ref(database, 'blueTreasury'), (treas) => treas + toTreasury);
+    runTransaction(ref(database, `users/${user.uid}/bank`), (currentBank) => currentBank + toBank);
+    runTransaction(ref(database, `users/${user.uid}/balance`), (currentBalance) => currentBalance + (net - toBank));
   }
 
   function handleUpgrade() {
-    if (balance >= workCost) {
-      set(ref(database, `users/${user.uid}/balance`), balance - workCost);
-      set(ref(database, `users/${user.uid}/workLevel`), workLevel + 5);
-      set(ref(database, `users/${user.uid}/workCost`), Math.ceil(workCost * 1.7));
-    }
+    runTransaction(ref(database, `users/${user.uid}/balance`), (currentBalance) => {
+      if (currentBalance >= workCost) {
+        runTransaction(ref(database, `users/${user.uid}/workLevel`), (level) => level + 5);
+        runTransaction(ref(database, `users/${user.uid}/workCost`), (cost) => Math.ceil(cost * 1.7));
+        return currentBalance - workCost;
+      }
+      return currentBalance;
+    });
   }
 
   function handleAiWorkUpgrade() {
-    if (balance >= AI_WORK_COST && !aiWorkEnabled) {
-      set(ref(database, `users/${user.uid}/balance`), balance - AI_WORK_COST);
-      set(ref(database, `users/${user.uid}/aiWorkEnabled`), true);
-    }
+    runTransaction(ref(database, `users/${user.uid}/balance`), (currentBalance) => {
+      if (currentBalance >= AI_WORK_COST && !aiWorkEnabled) {
+        runTransaction(ref(database, `users/${user.uid}/aiWorkEnabled`), () => true);
+        return currentBalance - AI_WORK_COST;
+      }
+      return currentBalance;
+    });
+  }
+
+  function handleUpgradeCaptureSize() {
+    if (captureSizeLevel >= MAX_CAPTURE_SIZE_LEVEL) return;
+    runTransaction(ref(database, `users/${user.uid}/balance`), (currentBalance) => {
+      if (currentBalance >= CAPTURE_SIZE_UPGRADE_COST) {
+        runTransaction(ref(database, `users/${user.uid}/captureSizeLevel`), (level) => level + 1);
+        return currentBalance - CAPTURE_SIZE_UPGRADE_COST;
+      }
+      return currentBalance;
+    });
+  }
+
+  function handleUpgradeCdReduction() {
+    if (cdReductionLevel >= MAX_CD_REDUCTION_LEVEL) return;
+    runTransaction(ref(database, `users/${user.uid}/balance`), (currentBalance) => {
+      if (currentBalance >= CD_REDUCTION_UPGRADE_COST) {
+        runTransaction(ref(database, `users/${user.uid}/cdReductionLevel`), (level) => level + 1);
+        return currentBalance - CD_REDUCTION_UPGRADE_COST;
+      }
+      return currentBalance;
+    });
   }
 
   function doDeposit() {
     const amount = Number(depositInput);
     if (!Number.isFinite(amount) || amount <= 0 || balance < amount) return;
-    set(ref(database, `users/${user.uid}/balance`), balance - amount);
-    set(ref(database, `users/${user.uid}/bank`), bank + amount);
+    runTransaction(ref(database, `users/${user.uid}/balance`), (currentBalance) => currentBalance - amount);
+    runTransaction(ref(database, `users/${user.uid}/bank`), (currentBank) => currentBank + amount);
     setDepositInput('');
   }
 
@@ -1002,36 +1139,29 @@ function App() {
       return;
     }
     if (bank < amount) return;
-    set(ref(database, `users/${user.uid}/bank`), bank - amount);
-    set(ref(database, `users/${user.uid}/balance`), balance + amount);
-    set(ref(database, `users/${user.uid}/lastWithdraw`), nowMs);
+    runTransaction(ref(database, `users/${user.uid}/bank`), (currentBank) => currentBank - amount);
+    runTransaction(ref(database, `users/${user.uid}/balance`), (currentBalance) => currentBalance + amount);
+    runTransaction(ref(database, `users/${user.uid}/lastWithdraw`), () => nowMs);
     setWithdrawInput('');
   }
 
   function doDonate() {
     const amount = Number(donateInput);
     if (!Number.isFinite(amount) || amount <= 0 || balance < amount) return;
-    set(ref(database, `users/${user.uid}/balance`), balance - amount);
-    set(ref(database, 'blueTreasury'), blueTreasury + amount);
+    runTransaction(ref(database, `users/${user.uid}/balance`), (currentBalance) => currentBalance - amount);
+    runTransaction(ref(database, 'blueTreasury'), (treas) => treas + amount);
     setDonateInput('');
   }
 
   function handleUpgradeBank() {
     if (bankRate >= BANK_MAX_RATE) return;
     const cost = BANK_UPGRADE_BASE_COST * (bankUpgradeLevel + 1);
-    if (blueTreasury < cost) return;
-    set(ref(database, 'blueTreasury'), blueTreasury - cost);
-    set(ref(database, 'bankUpgradeLevel'), bankUpgradeLevel + 1);
-    set(ref(database, 'bankRate'), bankRate + BANK_RATE_STEP);
-  }
-
-  function handleUpgradeWork() {
-    const cost = WORK_UPGRADE_BASE_COST * (workUpgradeLevel + 1);
-    if (blueTreasury < cost) return;
-    const increment = 25 * (workUpgradeLevel + 1);
-    set(ref(database, 'blueTreasury'), blueTreasury - cost);
-    set(ref(database, 'workUpgradeLevel'), workUpgradeLevel + 1);
-    set(ref(database, 'globalWorkBonus'), globalWorkBonus + increment);
+    runTransaction(ref(database, 'blueTreasury'), (treas) => {
+      if (treas < cost) return treas;
+      runTransaction(ref(database, 'bankUpgradeLevel'), (level) => level + 1);
+      runTransaction(ref(database, 'bankRate'), (rate) => rate + BANK_RATE_STEP);
+      return treas - cost;
+    });
   }
 
   function handleBuildBunker() {
@@ -1174,6 +1304,8 @@ function App() {
   }
 
   const nextWithdrawInSec = Math.max(0, Math.ceil((30 * 60 * 1000 - (Date.now() - lastWithdraw)) / 1000));
+
+  const blueIncomePerMin = countResources(map, 1) * RESOURCE_INCOME + countFactories(map, 1) * FACTORY_INCOME;
 
   return (
     <div
@@ -1420,6 +1552,51 @@ function App() {
                     Потери: <b style={{ color: '#f44336' }}>{playerLosses}</b>
                   </div>
                 </div>
+                <div style={{ marginTop: 16, fontSize: 18 }}>
+                  <b>Улучшения войны</b>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+                  <div>
+                    Размер захвата: <b>{captureSizeLevel + 1} пикселя(ей)</b> (макс 4)
+                    <button
+                      onClick={handleUpgradeCaptureSize}
+                      disabled={captureSizeLevel >= MAX_CAPTURE_SIZE_LEVEL || balance < CAPTURE_SIZE_UPGRADE_COST}
+                      style={{
+                        background: captureSizeLevel >= MAX_CAPTURE_SIZE_LEVEL || balance < CAPTURE_SIZE_UPGRADE_COST ? '#888' : '#2196f3',
+                        color: '#fff',
+                        border: 'none',
+                        borderRadius: 4,
+                        padding: '4px 12px',
+                        marginLeft: 8,
+                        fontWeight: 600,
+                        cursor: captureSizeLevel >= MAX_CAPTURE_SIZE_LEVEL || balance < CAPTURE_SIZE_UPGRADE_COST ? 'not-allowed' : 'pointer',
+                        fontSize: 12
+                      }}
+                    >
+                      Улучшить ({CAPTURE_SIZE_UPGRADE_COST}$)
+                    </button>
+                  </div>
+                  <div>
+                    Уменьшение КД: <b>{cdReductionLevel} сек</b> (макс 5 сек)
+                    <button
+                      onClick={handleUpgradeCdReduction}
+                      disabled={cdReductionLevel >= MAX_CD_REDUCTION_LEVEL || balance < CD_REDUCTION_UPGRADE_COST}
+                      style={{
+                        background: cdReductionLevel >= MAX_CD_REDUCTION_LEVEL || balance < CD_REDUCTION_UPGRADE_COST ? '#888' : '#2196f3',
+                        color: '#fff',
+                        border: 'none',
+                        borderRadius: 4,
+                        padding: '4px 12px',
+                        marginLeft: 8,
+                        fontWeight: 600,
+                        cursor: cdReductionLevel >= MAX_CD_REDUCTION_LEVEL || balance < CD_REDUCTION_UPGRADE_COST ? 'not-allowed' : 'pointer',
+                        fontSize: 12
+                      }}
+                    >
+                      Улучшить ({CD_REDUCTION_UPGRADE_COST}$)
+                    </button>
+                  </div>
+                </div>
               </div>
             )}
 
@@ -1427,6 +1604,7 @@ function App() {
               <div>
                 <div style={{ marginBottom: 8 }}>
                   <b>Казна:</b> <span style={{ color: '#ffe259', fontWeight: 700 }}>{blueTreasury.toFixed(2)}$</span>
+                  <span style={{ color: '#aaa', marginLeft: 8 }}>(+{blueIncomePerMin}$/мин от ресурсов и фабрик)</span>
                 </div>
                 <div style={{ marginBottom: 8 }}>
                   <b>Имя:</b>{' '}
@@ -1592,6 +1770,7 @@ function App() {
                 </div>
                 <div style={{ marginBottom: 8 }}>
                   <b>Казна:</b> <span style={{ color: '#ffe259', fontWeight: 700 }}>{blueTreasury.toFixed(2)}$</span>
+                  <span style={{ color: '#aaa', marginLeft: 8 }}>(+{blueIncomePerMin}$/мин от ресурсов и фабрик)</span>
                 </div>
                 <div style={{ marginBottom: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
                   <div style={{ fontSize: 14 }}>
@@ -1618,26 +1797,6 @@ function App() {
                       }}
                     >
                       Улучшить ({BANK_UPGRADE_BASE_COST * (bankUpgradeLevel + 1)}$)
-                    </button>
-                  </div>
-                  <div style={{ fontSize: 14 }}>
-                    <b>Работа:</b> Ур. {workUpgradeLevel}, бонус {globalWorkBonus}$
-                    <button
-                      onClick={handleUpgradeWork}
-                      disabled={blueTreasury < WORK_UPGRADE_BASE_COST * (workUpgradeLevel + 1)}
-                      style={{
-                        background: blueTreasury < WORK_UPGRADE_BASE_COST * (workUpgradeLevel + 1) ? '#888' : '#2196f3',
-                        color: '#fff',
-                        border: 'none',
-                        borderRadius: 4,
-                        padding: '4px 12px',
-                        marginLeft: 8,
-                        fontWeight: 600,
-                        cursor: blueTreasury < WORK_UPGRADE_BASE_COST * (workUpgradeLevel + 1) ? 'not-allowed' : 'pointer',
-                        fontSize: 12
-                      }}
-                    >
-                      Улучшить ({WORK_UPGRADE_BASE_COST * (workUpgradeLevel + 1)}$)
                     </button>
                   </div>
                   <div style={{ fontSize: 14 }}>
@@ -1800,7 +1959,7 @@ function App() {
         Клик по <span style={{ color: cooldown ? colors.borderDisabled : colors.border, fontWeight: 700 }}>жёлтым</span> для захвата.<br />
         Окружённые — авто.<br />
         Темнее — несколько кликов.<br />
-        <span style={{ color: '#ffe259' }}>КД: 10 сек</span>
+        <span style={{ color: '#ffe259' }}>КД: {Math.max(5, 10 - cdReductionLevel)} сек</span>
       </div>
     </div>
   );
